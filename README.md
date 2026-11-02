@@ -2,7 +2,7 @@
 
 ### qextract
 
-[![](https://img.shields.io/badge/Category-DFIR%20%2F%20Incident%20Response-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Language-Python%203.11-E5A505?style=flat-square&logo=python&logoColor=white)]() [![](https://img.shields.io/badge/Build%20script-PowerShell-E5A505?style=flat-square&logo=powershell&logoColor=white)]() [![](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Version-0.1.43-E5A505?style=flat-square&color=green)]() [![](https://img.shields.io/badge/License-All%20rights%20reserved-E5A505?style=flat-square&color=lightgrey)]()
+[![](https://img.shields.io/badge/Category-DFIR%20%2F%20Incident%20Response-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Language-Python%203.11-E5A505?style=flat-square&logo=python&logoColor=white)]() [![](https://img.shields.io/badge/Build%20script-PowerShell-E5A505?style=flat-square&logo=powershell&logoColor=white)]() [![](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Version-0.1.44-E5A505?style=flat-square&color=green)]() [![](https://img.shields.io/badge/License-All%20rights%20reserved-E5A505?style=flat-square&color=lightgrey)]()
 
 <br clear="left">
 
