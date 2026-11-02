@@ -1,8 +1,10 @@
-<p align="center"><img src="quarantine-extractor.png" width="128" alt="qextract logo"></p>
+<img src="quarantine-extractor.png" width="128" align="left" alt="qextract logo">
 
 # qextract
 
-[![](https://img.shields.io/badge/Category-DFIR%20%2F%20Incident%20Response-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Language-Python%203.11-E5A505?style=flat-square&logo=python&logoColor=white)]() [![](https://img.shields.io/badge/Build%20script-PowerShell-E5A505?style=flat-square&logo=powershell&logoColor=white)]() [![](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Version-0.1.40-E5A505?style=flat-square&color=green)]() [![](https://img.shields.io/badge/License-All%20rights%20reserved-E5A505?style=flat-square&color=lightgrey)]()
+[![](https://img.shields.io/badge/Category-DFIR%20%2F%20Incident%20Response-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Language-Python%203.11-E5A505?style=flat-square&logo=python&logoColor=white)]() [![](https://img.shields.io/badge/Build%20script-PowerShell-E5A505?style=flat-square&logo=powershell&logoColor=white)]() [![](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Version-0.1.41-E5A505?style=flat-square&color=green)]() [![](https://img.shields.io/badge/License-All%20rights%20reserved-E5A505?style=flat-square&color=lightgrey)]()
+
+<br clear="left">
 
 qextract pulls antivirus quarantine files and AV logs out of disk images, drives and
 folders, decodes the quarantined files and builds one detection timeline. One Windows exe,
