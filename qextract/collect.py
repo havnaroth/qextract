@@ -1,0 +1,346 @@
+"""Copy matched files out of the volumes, run decoders and write everything into one zip."""
+
+import csv
+import datetime
+import hashlib
+import io
+import os
+import re
+
+from .decoders import DECODERS
+from .fs import error_text
+from .output import OutputFolder
+from .parsers import PARSERS
+
+FILE_COLUMNS = ['volume', 'source', 'artifact', 'kind', 'path', 'deleted', 'size',
+                'created', 'modified', 'accessed', 'sha256', 'saved_as', 'note', 'error']
+QUARANTINE_COLUMNS = ['volume', 'source', 'container', 'detection', 'quarantined', 'threat_id',
+                      'item_type', 'original_path', 'resource', 'status', 'size', 'md5', 'sha1',
+                      'sha256', 'saved_as', 'file_created', 'file_modified', 'file_accessed',
+                      'owner_sid', 'zone_id', 'host_url', 'referrer_url', 'notes']
+DETECTION_COLUMNS = ['time', 'product', 'event_id', 'event', 'threat', 'path', 'action', 'user',
+                     'process', 'details', 'volume', 'source', 'evidence', 'record', 'recovered']
+
+ZIP_DEFLATED = 8
+ZIP_PASSWORD = b'infected'  # nosec B105 - the default: the agreed convention for sharing malware, not a secret
+RECOVERED_EXTENSION = 'infected'
+METADATA_SUFFIX = 'metadata.txt'
+DEFAULT_MAX_DECODE_BYTES = 1024 * 1024 * 1024
+
+_BAD_CHARS = re.compile(r'[<>:"|?*/\\\x00-\x1f]')
+_FORMULA_START = ('=', '+', '-', '@', '\t', '\r')
+# control characters but tab and line breaks: escape sequences from the evidence would steer
+# a terminal that shows the CSV (type, cat, less)
+_CSV_CONTROL = re.compile('[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x9b]')
+
+
+def iso(ts):
+    if not ts:
+        return ''
+    try:
+        return datetime.datetime.fromtimestamp(ts, datetime.UTC).isoformat().replace('+00:00', 'Z')
+    except (OverflowError, OSError, ValueError):
+        return ''
+
+
+def safe_name(part):
+    """One file name for the output folder. Names from the evidence may hold path separators
+    or '..' (legal on ext/HFS), which must not lead outside the output folder."""
+    part = _BAD_CHARS.sub('_', part).rstrip('. ')
+    return part or '_'
+
+
+def is_event_log(artifact, entry):
+    """Windows event logs can be gigabytes; copying them is the user's choice."""
+    return artifact.get('kind') == 'eventlog' or entry.path.lower().endswith('.evtx')
+
+
+def human_size(size):
+    if size >= 1024 ** 3:
+        return f'{size / 1024 ** 3:.1f} GB'
+    return f'{max(size / 1024 ** 2, 0.1):.1f} MB'
+
+
+def _zip_time(ts):
+    """A zip member time (UTC; the format only holds 1980-2107)."""
+    try:
+        t = datetime.datetime.fromtimestamp(ts, datetime.UTC) if ts else datetime.datetime.now(datetime.UTC)
+    except (OverflowError, OSError, ValueError):
+        t = datetime.datetime.now(datetime.UTC)
+    t = min(max(t, datetime.datetime(1980, 1, 1, tzinfo=datetime.UTC)),
+            datetime.datetime(2107, 12, 31, 23, 59, 58, tzinfo=datetime.UTC))
+    return t.timetuple()[:6]
+
+
+def _csv(columns, rows):
+    """Rows as CSV text, sorted by time where they have one."""
+    buf = io.StringIO(newline='')
+    writer = SafeWriter(buf, columns, extrasaction='ignore')
+    writer.writeheader()
+    for r in sorted(rows, key=lambda r: str(r.get('time', ''))):
+        writer.writerow(r)
+    return buf.getvalue()
+
+
+class SafeWriter(csv.DictWriter):
+    """Values come from the evidence (file names, detection names chosen by an attacker);
+    a leading '=' etc. would run as a formula when the CSV is opened in Excel, and control
+    characters could steer a terminal."""
+
+    @staticmethod
+    def _clean(v):
+        if not isinstance(v, str):
+            return v
+        v = _CSV_CONTROL.sub('?', v)
+        return f"'{v}" if v.startswith(_FORMULA_START) else v
+
+    def writerow(self, row):
+        return super().writerow({k: self._clean(v) for k, v in row.items()})
+
+
+class Context:
+    """What a decoder sees: one volume, one source."""
+
+    def __init__(self, collector, volume, source):
+        self.collector, self.volume, self.source = collector, volume, source
+        self.max_bytes = collector.max_decode_bytes
+
+    def read(self, entry):
+        """A whole file in memory, refused above the decode limit (a crafted or huge file
+        must not exhaust memory); the file is still copied into the zip as usual."""
+        if entry.size > self.max_bytes:
+            raise ValueError(f'{entry.size:,} bytes, above the decode limit of {self.max_bytes:,}')
+        return self.volume.read(entry)
+
+    def open(self, entry):
+        """The file as a seekable stream, for parsers of big files (no size limit, nothing
+        held in memory). The caller closes it."""
+        return self.volume.open(entry)
+
+    def save(self, name, data, metadata=None):
+        """metadata: text (see decoders.util.metadata_text) stored next to the file."""
+        return self.collector.save_recovered(self.source['id'], name, data, metadata)
+
+    def warn(self, message):
+        self.collector.warn(f'{self.volume.name}/{self.source["id"]}: {message}')
+
+    def table(self, name, rows):
+        """Rows for an extra report <name>.csv (columns in the order first seen), for data
+        too plentiful for the detections.csv timeline."""
+        if name.lower() in ('collected_files', 'quarantine', 'detections', 'summary'):
+            raise ValueError(f'table name "{name}" is taken by a standard report')
+        for r in rows:
+            r.setdefault('volume', self.volume.name)
+            r.setdefault('source', self.source['id'])
+        self.collector._tables.setdefault(name, []).extend(rows)
+
+
+class Collector:
+    """Everything the run produces goes into ONE zip in the output folder (AES, password
+    "infected"): malware/ holds the recovered quarantine files, info/ everything else
+    (reports, copied files, log, summary)."""
+
+    def __init__(self, out, log, max_decode_bytes=DEFAULT_MAX_DECODE_BYTES, started=None, password=None,
+                 protected=(), zip_name=None):
+        self.out = os.path.abspath(out)
+        # the zip is always encrypted: a custom password may replace "infected", never remove it
+        self.password = password.encode('utf-8') if password else ZIP_PASSWORD
+        # always time-stamped (UTC start of the run), e.g. qextract_recovered_20261101_093000.zip;
+        # a given name (the zip next to an image) is only ever created new, nothing is replaced
+        started = started or datetime.datetime.now(datetime.UTC)
+        self.zip_name = zip_name or f'qextract_recovered_{started:%Y%m%d_%H%M%S}.zip'
+        self._replace = zip_name is None
+        # the zip is created through it: links refused, never inside the (read-only) input
+        self.output = OutputFolder(self.out, protected)
+        self.log = log
+        self.max_decode_bytes = max_decode_bytes
+        self.warnings = []
+        self._zip = self._zip_file = None
+        self._copied = {}
+        self._members = set()      # lower-case member names, to keep them unique
+        self._tables = {}
+
+    def warn(self, message):
+        self.warnings.append(message)
+        self.log(f'  WARNING: {message}')
+
+    def _archive(self):
+        if self._zip is None:
+            import pyzipper
+            self._zip_file = self.output.create(self.zip_name, replace=self._replace)
+            self._zip = pyzipper.AESZipFile(self._zip_file, 'w', compression=pyzipper.ZIP_DEFLATED,
+                                            encryption=pyzipper.WZ_AES)
+            self._zip.setpassword(self.password)
+        return self._zip
+
+    def _member(self, base, suffix=''):
+        """A member name not used yet: base+suffix, else base_2+suffix, ... -> the stem"""
+        stem, n = base, 1
+        while f'{stem}{suffix}'.lower() in self._members:
+            n += 1
+            stem = f'{base}_{n}'
+        self._members.add(f'{stem}{suffix}'.lower())
+        return stem
+
+    def save_recovered(self, source_id, name, data, metadata=None):
+        """Recovered files are live malware. They only ever go into the encrypted zip
+        (malware/<source>/..., password "infected") and get the extension .infected, so that
+        even unpacked they do not run on a double click. There is deliberately no option to
+        write them plainly. Metadata text, when given, goes next to the file as
+        <name>.metadata.txt."""
+        stem = self._member(f'malware/{safe_name(source_id)}/{safe_name(name)}', f'.{RECOVERED_EXTENSION}')
+        name = f'{stem}.{RECOVERED_EXTENSION}'
+        self._archive().writestr(name, data)
+        if metadata:
+            self._members.add(f'{stem}.{METADATA_SUFFIX}'.lower())
+            self._archive().writestr(f'{stem}.{METADATA_SUFFIX}', metadata.encode('utf-8'))
+        return f'{self.zip_name}/{name}'
+
+    def add_info(self, name, data):
+        """A report or other non-malware file into info/ (str is written as UTF-8 with BOM)."""
+        if isinstance(data, str):
+            data = data.encode('utf-8-sig')
+        self._archive().writestr(self._member(f'info/{name}'), data)
+
+    def close(self):
+        """Finish the zip; creates it if nothing was written yet. The file is closed even when
+        finishing fails (a full disk), so nothing stays locked."""
+        try:
+            self._archive().close()
+        finally:
+            if self._zip_file is not None:
+                self._zip_file.close()
+            self._zip = self._zip_file = None
+
+    def _copy(self, volume, entry):
+        """Stream one file from the evidence into info/files/<volume>/<path> in the zip."""
+        key = (volume.name, entry.path.lower(), entry.deleted)
+        if key in self._copied:
+            return self._copied[key]
+        base = '/'.join(['info', 'files', safe_name(volume.name), *(safe_name(p) for p in entry.path.split('/'))])
+        stem, n = base, 1
+        while stem.lower() in self._members:
+            n += 1
+            stem = f'{base} ({n})'
+        self._members.add(stem.lower())
+        archive = self._archive()
+        info = archive.zipinfo_cls(stem, date_time=_zip_time(entry.modified))
+        info.compress_type = ZIP_DEFLATED
+        digest = hashlib.sha256()
+        with archive.open(info, 'w', force_zip64=True) as f:
+            try:
+                for chunk in volume.chunks(entry):
+                    digest.update(chunk)
+                    f.write(chunk)
+            except OSError as e:
+                raise OSError(f'{e} (the copy {stem} in the zip is incomplete)') from e
+        result = (f'{self.zip_name}/{stem}', digest.hexdigest())
+        self._copied[key] = result
+        return result
+
+    @staticmethod
+    def _match(volume, art, roots):
+        matched = {}
+        for root in roots:
+            for pattern in art['paths']:
+                for e in volume.glob(pattern, root):
+                    matched.setdefault((e.path.lower(), e.deleted), e)
+        return sorted(matched.values(), key=lambda e: e.path.lower())
+
+    def _plan(self, volumes, sources):
+        """Every match before anything is copied, so the size of the event logs is known
+        up front. Folder listings are cached, so the second walk costs nothing."""
+        plan = []
+        for volume in volumes:
+            roots = volume.roots()
+            work = [(source, art, entries) for source in sources for art in source['artifacts']
+                    if (entries := self._match(volume, art, roots))]
+            plan.append((volume, roots, work))
+        return plan
+
+    def run(self, volumes, sources, copy_event_logs=None):
+        """copy_event_logs: None = copy them, or a callable(count, total bytes) -> bool that
+        decides once the size of all matched event logs is known (the CLI asks the user)."""
+        stats, detections, listed = {}, [], set()
+        plan = self._plan(volumes, sources)
+        logs = {(v.name, e.path.lower(), e.deleted): e.size for v, _roots, work in plan
+                for _source, art, entries in work for e in entries if is_event_log(art, e)}
+        copy_logs = True
+        if logs and copy_event_logs is not None:
+            copy_logs = bool(copy_event_logs(len(logs), sum(logs.values())))
+
+        # the reports go into the zip at the end, also when the run fails half way
+        files_csv, quar_csv = io.StringIO(newline=''), io.StringIO(newline='')
+        try:
+            files = SafeWriter(files_csv, FILE_COLUMNS, extrasaction='ignore')
+            quar = SafeWriter(quar_csv, QUARANTINE_COLUMNS, extrasaction='ignore')
+            files.writeheader()
+            quar.writeheader()
+            for volume, roots, work in plan:
+                self.log(f'Volume {volume.name}: {volume.description}')
+                if roots != ['']:
+                    self.log(f'  Windows folders found under: {", ".join("/" + r for r in roots)}')
+                for source, art, entries in work:
+                    s = stats.setdefault(source['id'], {'name': source['name'], 'files': 0, 'bytes': 0,
+                                                        'quarantine_items': 0, 'recovered': 0, 'events': 0})
+                    self.log(f'  {source["name"]} - {art["name"]}: {len(entries)} file(s)')
+                    for e in entries:
+                        key = (volume.name, source['id'], e.path.lower(), e.deleted)
+                        if key in listed:
+                            continue    # same file matched by another artifact of this product
+                        listed.add(key)
+                        row = {'volume': volume.name, 'source': source['id'], 'artifact': art['name'],
+                               'kind': art['kind'], 'path': e.path, 'deleted': 'yes' if e.deleted else '',
+                               'size': e.size, 'created': iso(e.created), 'modified': iso(e.modified),
+                               'accessed': iso(e.accessed)}
+                        if not copy_logs and is_event_log(art, e):
+                            row['note'] = 'event log not copied (read in place for the timeline)'
+                            files.writerow(row)
+                            continue
+                        try:
+                            row['saved_as'], row['sha256'] = self._copy(volume, e)
+                            s['files'] += 1
+                            s['bytes'] += e.size
+                        except OSError as err:
+                            row['error'] = str(err)
+                            self.warn(f'cannot copy {e.path}: {error_text(err)}')
+                        files.writerow(row)
+                    if art.get('decoder'):
+                        ctx = Context(self, volume, source)
+                        try:
+                            rows = DECODERS[art['decoder']](ctx, entries, art['options'])
+                        except Exception as err:  # noqa: BLE001 - a broken decoder must not stop the collection
+                            self.warn(f'decoder "{art["decoder"]}" failed: {err!r}')
+                            rows = []
+                        for r in rows:
+                            r.setdefault('volume', volume.name)
+                            r.setdefault('source', source['id'])
+                            quar.writerow(r)
+                            s['quarantine_items'] += 1
+                            s['recovered'] += 1 if r.get('saved_as') else 0
+                        if rows:
+                            saved = sum(1 for r in rows if r.get('saved_as'))
+                            self.log(f'    decoded {len(rows)} item(s), recovered {saved}')
+                    if art.get('parser'):
+                        ctx = Context(self, volume, source)
+                        try:
+                            rows = PARSERS[art['parser']](ctx, entries, art['options'])
+                        except Exception as err:  # noqa: BLE001 - a broken parser must not stop the collection
+                            self.warn(f'parser "{art["parser"]}" failed: {err!r}')
+                            rows = []
+                        for r in rows:
+                            r.setdefault('volume', volume.name)
+                            r.setdefault('source', source['id'])
+                        detections += rows
+                        s['events'] += len(rows)
+                        if rows:
+                            self.log(f'    {len(rows)} event(s) for the timeline')
+                for w in volume.warnings:
+                    self.warn(f'{volume.name}: {w}')
+        finally:
+            self.add_info('collected_files.csv', files_csv.getvalue())
+            self.add_info('quarantine.csv', quar_csv.getvalue())
+        self.add_info('detections.csv', _csv(DETECTION_COLUMNS, detections))
+        for name, rows in self._tables.items():
+            self.add_info(f'{safe_name(name)}.csv', _csv(list(dict.fromkeys(k for r in rows for k in r)), rows))
+        return {k: v for k, v in stats.items() if v['files'] or v['quarantine_items'] or v['events']}

@@ -1,0 +1,21 @@
+# Checks run by build.ps1 before the exe is built: ruff (lint + security rules) and bandit.
+# A finding stops the build. Deliberate exceptions in the code carry `# noqa` / `# nosec`
+# with the reason next to them.
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["build", "dist", "qextract/sources"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "S", "UP", "SIM", "BLE", "PLW"]
+
+[tool.ruff.lint.per-file-ignores]
+# tests (kept local, not in the repository): assert is the point; temporary folders, random
+# data, test passwords and long sample lines are fixtures
+"tests/**" = ["S101", "S105", "S106", "S108", "S311", "S324", "S603", "S607", "B011", "SIM115", "SIM117", "E501"]
+# development tools run by the developer, never shipped in the exe
+"tools/**" = ["S311", "S603", "S607", "PLW1510", "E501"]
+
+[tool.bandit]
+exclude_dirs = ["tests", "tools", "build", "dist"]
