@@ -2,7 +2,7 @@
 
 ### qextract
 
-[![](https://img.shields.io/badge/Category-DFIR%20%2F%20Incident%20Response-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Language-Python%203.11-E5A505?style=flat-square&logo=python&logoColor=white)]() [![](https://img.shields.io/badge/Build%20script-PowerShell-E5A505?style=flat-square&logo=powershell&logoColor=white)]() [![](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Version-0.1.43-E5A505?style=flat-square&color=green)]() [![](https://img.shields.io/badge/License-All%20rights%20reserved-E5A505?style=flat-square&color=lightgrey)]()
+[![](https://img.shields.io/badge/Category-DFIR%20%2F%20Incident%20Response-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Language-Python%203.11-E5A505?style=flat-square&logo=python&logoColor=white)]() [![](https://img.shields.io/badge/Build%20script-PowerShell-E5A505?style=flat-square&logo=powershell&logoColor=white)]() [![](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Version-0.1.44-E5A505?style=flat-square&color=green)]() [![](https://img.shields.io/badge/License-All%20rights%20reserved-E5A505?style=flat-square&color=lightgrey)]()
 
 <br clear="left">
 
@@ -69,7 +69,7 @@ its own results, e.g. `-i C: -o C:\cases\host01`; that folder is left out of the
 | Elastic Defend | ✅ | | ✅ |
 | Emsisoft | ✅ | ✅ 2026-11-02 | ✅ |
 | ESET | ✅ | ✅ 2026-11-02 | ✅ |
-| F-Secure / WithSecure | ✅ | | ✅ |
+| F-Secure / WithSecure | ✅ | ✅ 2026-11-02 | ✅ + event log |
 | Fortect | | | ✅ |
 | FortiClient Endpoint Protection | ✅ | ✅ untested | |
 | G DATA | ✅ | ✅ untested | |
@@ -97,7 +97,8 @@ its own results, e.g. `-i C: -o C:\cases\host01`; that folder is left out of the
 Plus the AV-related Windows event logs. `qextract.exe --list-sources` shows everything a build knows.
 
 **Logs in the timeline:** Defender `Operational.evtx`, MPLog and MPDetection logs,
-`Application.evtx` (AV products, Security Center), Symantec event logs.
+`Application.evtx` (AV products, Security Center), Symantec event logs, WithSecure EDR store
+(`ATP\pstor\state.db`) and `FSecureUltralightSDK.evtx`: detections, including scripts blocked by AMSI.
 
 ## Usage
 

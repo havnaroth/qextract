@@ -19,4 +19,4 @@ def parser(name):
     return register
 
 
-from . import evtx, mplog  # noqa: E402,F401  (registers the built-in parsers)
+from . import evtx, mplog, withsecure  # noqa: E402,F401  (registers the built-in parsers)

@@ -130,7 +130,12 @@ def guard(rows, entry):
 
 def open_sqlite(data):
     """An SQLite database from the evidence: in memory, read-only, schema not trusted
-    (no functions from views or triggers), text that is not UTF-8 kept instead of failing."""
+    (no functions from views or triggers), text that is not UTF-8 kept instead of failing.
+    A database in WAL mode (header bytes 18-19 = 2) cannot be opened from memory, so the copy
+    is switched to rollback mode; what is still only in the -wal file next to it is not read."""
+    data = bytearray(data)
+    if data[18:20] == b'\x02\x02':
+        data[18:20] = b'\x01\x01'
     con = sqlite3.connect(':memory:')
     con.deserialize(bytes(data))
     con.execute('PRAGMA trusted_schema = OFF')
