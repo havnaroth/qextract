@@ -38,6 +38,7 @@ output: one zip, qextract_recovered_<UTC start time>.zip (e.g. ..._20261101_0930
         info\\mplog_processes.csv  Defender MPLog per-process lines (evidence of execution)
         info\\collected_files.csv  every copied file with times and SHA256
         info\\files\\<volume>\\...   copies, original folder layout
+        info\\decoded\\<volume>\\... readable forms of obfuscated logs / settings
         info\\summary.json, info\\qextract.log
 
 Add products by dropping a JSON definition into a "sources" folder next to the

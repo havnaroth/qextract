@@ -124,6 +124,12 @@ class Context:
     def warn(self, message):
         self.collector.warn(f'{self.volume.name}/{self.source["id"]}: {message}')
 
+    def save_decoded(self, entry, data, suffix='.decoded'):
+        """A readable form of an obfuscated log or settings file (not malware), next to the
+        copies: info/decoded/<volume>/<path><suffix>."""
+        parts = ['decoded', safe_name(self.volume.name), *(safe_name(p) for p in entry.path.split('/'))]
+        return self.collector.add_info('/'.join(parts) + suffix, data)
+
     def table(self, name, rows):
         """Rows for an extra report <name>.csv (columns in the order first seen), for data
         too plentiful for the detections.csv timeline."""
@@ -200,7 +206,9 @@ class Collector:
         """A report or other non-malware file into info/ (str is written as UTF-8 with BOM)."""
         if isinstance(data, str):
             data = data.encode('utf-8-sig')
-        self._archive().writestr(self._member(f'info/{name}'), data)
+        member = self._member(f'info/{name}')
+        self._archive().writestr(member, data)
+        return f'{self.zip_name}/{member}'
 
     def close(self):
         """Finish the zip; creates it if nothing was written yet. The file is closed even when
