@@ -22,7 +22,7 @@ To build it yourself:
 ```
 git clone https://github.com/havnaroth/qextract
 cd qextract
-powershell -ExecutionPolicy Bypass -File build.ps1      # checks (ruff, bandit), then dist\qextract.exe
+powershell -ExecutionPolicy Bypass -File build.ps1      # builds dist\qextract.exe
 ```
 
 The location database is not in the repository: an exe built from it knows only the
