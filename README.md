@@ -86,7 +86,7 @@ its own results, e.g. `-i C: -o C:\cases\host01`; that folder is left out of the
 | SecureAge | | | ✅ |
 | SentinelOne | ✅ | | ✅ |
 | Sophos | ✅ | | ✅ |
-| SUPERAntiSpyware | | | ✅ |
+| SUPERAntiSpyware | ✅ | ✅ 2026-11-02 | ✅ |
 | Symantec Endpoint Protection | ✅ | ✅ untested | ✅ + event logs |
 | TotalAV | | | ✅ |
 | Trend Micro | ✅ | | ✅ |
