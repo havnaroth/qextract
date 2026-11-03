@@ -200,6 +200,7 @@ def decode(ctx, files, options):
             sha1=digest('sha1', content),
             sha256=hashlib.sha256(content).hexdigest(),
             status='recovered' if intact else 'recovered (container SHA1 differs from resource name)',
+            verified_by='sha1 of the container' if intact else 'sha1 mismatch',
         )
         sections = describe_streams(row, streams)
         if trailing:

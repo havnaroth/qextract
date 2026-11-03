@@ -7,19 +7,23 @@ import io
 import os
 import re
 
+from . import report
 from .decoders import DECODERS
 from .fs import error_text
+from .host import public, read_host
 from .output import OutputFolder
 from .parsers import PARSERS
 
 FILE_COLUMNS = ['volume', 'source', 'artifact', 'kind', 'path', 'deleted', 'size',
                 'created', 'modified', 'accessed', 'sha256', 'saved_as', 'note', 'error']
+# schema 1 columns first, in their order; the normalized ones (report.py) appended
 QUARANTINE_COLUMNS = ['volume', 'source', 'container', 'detection', 'quarantined', 'threat_id',
                       'item_type', 'original_path', 'resource', 'status', 'size', 'md5', 'sha1',
                       'sha256', 'saved_as', 'file_created', 'file_modified', 'file_accessed',
-                      'owner_sid', 'zone_id', 'host_url', 'referrer_url', 'notes']
+                      'owner_sid', 'zone_id', 'host_url', 'referrer_url', 'notes'] + report.QUARANTINE_EXTRA
 DETECTION_COLUMNS = ['time', 'product', 'event_id', 'event', 'threat', 'path', 'action', 'user',
                      'process', 'details', 'volume', 'source', 'evidence', 'record', 'recovered']
+DETECTION_COLUMNS += report.DETECTION_EXTRA
 
 ZIP_DEFLATED = 8
 ZIP_PASSWORD = b'infected'  # nosec B105 - the default: the agreed convention for sharing malware, not a secret
@@ -41,6 +45,11 @@ def iso(ts):
         return datetime.datetime.fromtimestamp(ts, datetime.UTC).isoformat().replace('+00:00', 'Z')
     except (OverflowError, OSError, ValueError):
         return ''
+
+
+def _specificity(pattern):
+    """Length of the fixed start of a path pattern, before its first wildcard."""
+    return len(re.split(r'[*?]|regex:', pattern.replace('\\', '/'), maxsplit=1)[0])
 
 
 def safe_name(part):
@@ -72,12 +81,12 @@ def _zip_time(ts):
     return t.timetuple()[:6]
 
 
-def _csv(columns, rows):
+def _csv(columns, rows, sort=True):
     """Rows as CSV text, sorted by time where they have one."""
     buf = io.StringIO(newline='')
     writer = SafeWriter(buf, columns, extrasaction='ignore')
     writer.writeheader()
-    for r in sorted(rows, key=lambda r: str(r.get('time', ''))):
+    for r in (sorted(rows, key=lambda r: str(r.get('time', ''))) if sort else rows):
         writer.writerow(r)
     return buf.getvalue()
 
@@ -165,6 +174,8 @@ class Collector:
         self._copied = {}
         self._members = set()      # lower-case member names, to keep them unique
         self._tables = {}
+        # filled by run(), read by the CLI for summary.txt / summary.json
+        self.hosts, self.detections, self.quarantine, self.incidents = {}, [], [], []
 
     def warn(self, message):
         self.warnings.append(message)
@@ -248,12 +259,47 @@ class Collector:
 
     @staticmethod
     def _match(volume, art, roots):
+        """-> {(path, deleted): (entry, how specific the most specific matching pattern is)}"""
         matched = {}
         for root in roots:
             for pattern in art['paths']:
+                spec = _specificity(pattern)
                 for e in volume.glob(pattern, root):
-                    matched.setdefault((e.path.lower(), e.deleted), e)
-        return sorted(matched.values(), key=lambda e: e.path.lower())
+                    key = (e.path.lower(), e.deleted)
+                    if key not in matched or matched[key][1] < spec:
+                        matched[key] = (e, spec)
+        return matched
+
+    def _owners(self, volume, roots, sources, matches):
+        """One file belongs to one product. When several products match a file (WithSecure
+        Elements and the consumer F-Secure app share ProgramData/F-Secure), it goes to the
+        product whose marker files exist on this volume, then to the more specific pattern,
+        then to the first product, with a warning."""
+        claims = {}
+        for source, _art, matched in matches:
+            for key, (_e, spec) in matched.items():
+                c = claims.setdefault(key, {})
+                c[source['id']] = max(spec, c.get(source['id'], -1))
+        by_id = {s['id']: s for s in sources}
+        order = {s['id']: n for n, s in enumerate(sources)}
+        present = {}
+        owners, ambiguous = {}, set()
+        for key, c in claims.items():
+            if len(c) == 1:
+                continue
+            for sid in c:
+                if sid not in present:
+                    present[sid] = any(next(iter(volume.glob(m, root)), None) is not None
+                                       for m in by_id[sid].get('markers', []) for root in roots)
+            ranked = sorted(c, key=lambda sid: (not present[sid], -c[sid], order[sid]))
+            best, second = ranked[0], ranked[1]
+            if (present[best], c[best]) == (present[second], c[second]):
+                ambiguous.add((best, *sorted(set(c) - {best})))
+            owners[key] = best
+        for best, *others in sorted(ambiguous):
+            self.warn(f'{volume.name}: files matched by {best} and {", ".join(others)}; no marker shows which '
+                      f'product is installed, so they were given to {best}')
+        return owners
 
     def _plan(self, volumes, sources):
         """Every match before anything is copied, so the size of the event logs is known
@@ -261,8 +307,15 @@ class Collector:
         plan = []
         for volume in volumes:
             roots = volume.roots()
-            work = [(source, art, entries) for source in sources for art in source['artifacts']
-                    if (entries := self._match(volume, art, roots))]
+            matches = [(source, art, matched) for source in sources for art in source['artifacts']
+                       if (matched := self._match(volume, art, roots))]
+            owners = self._owners(volume, roots, sources, matches)
+            work = []
+            for source, art, matched in matches:
+                entries = sorted((e for key, (e, _spec) in matched.items()
+                                  if owners.get(key, source['id']) == source['id']), key=lambda e: e.path.lower())
+                if entries:
+                    work.append((source, art, entries))
             plan.append((volume, roots, work))
         return plan
 
@@ -278,16 +331,24 @@ class Collector:
             copy_logs = bool(copy_event_logs(len(logs), sum(logs.values())))
 
         # the reports go into the zip at the end, also when the run fails half way
-        files_csv, quar_csv = io.StringIO(newline=''), io.StringIO(newline='')
+        files_csv = io.StringIO(newline='')
+        quarantine = []
         try:
             files = SafeWriter(files_csv, FILE_COLUMNS, extrasaction='ignore')
-            quar = SafeWriter(quar_csv, QUARANTINE_COLUMNS, extrasaction='ignore')
             files.writeheader()
-            quar.writeheader()
             for volume, roots, work in plan:
                 self.log(f'Volume {volume.name}: {volume.description}')
                 if roots != ['']:
                     self.log(f'  Windows folders found under: {", ".join("/" + r for r in roots)}')
+                for root in roots:
+                    host = read_host(volume, root)
+                    if host:
+                        self.hosts[volume.name] = host
+                        h = public(host)
+                        problem = f" ({h['error']})" if h.get('error') else ''
+                        self.log(f"  Host: {h.get('computer', '?')}, {h.get('os', 'Windows version unknown')}, "
+                                 f"time zone {h.get('time_zone', 'unknown')}{problem}")
+                        break
                 for source, art, entries in work:
                     s = stats.setdefault(source['id'], {'name': source['name'], 'files': 0, 'bytes': 0,
                                                         'quarantine_items': 0, 'recovered': 0, 'events': 0})
@@ -323,7 +384,7 @@ class Collector:
                         for r in rows:
                             r.setdefault('volume', volume.name)
                             r.setdefault('source', source['id'])
-                            quar.writerow(r)
+                            quarantine.append(r)
                             s['quarantine_items'] += 1
                             s['recovered'] += 1 if r.get('saved_as') else 0
                         if rows:
@@ -347,8 +408,14 @@ class Collector:
                     self.warn(f'{volume.name}: {w}')
         finally:
             self.add_info('collected_files.csv', files_csv.getvalue())
-            self.add_info('quarantine.csv', quar_csv.getvalue())
+            try:
+                self.incidents = report.normalize_all(detections, quarantine, self.hosts)
+            except Exception as err:  # noqa: BLE001 - the raw rows are still written
+                self.warn(f'report normalization failed: {err!r}')
+            self.add_info('quarantine.csv', _csv(QUARANTINE_COLUMNS, quarantine, sort=False))
+            self.detections, self.quarantine = detections, quarantine
         self.add_info('detections.csv', _csv(DETECTION_COLUMNS, detections))
+        self.add_info('incidents.csv', _csv(report.INCIDENT_COLUMNS, self.incidents, sort=False))
         for name, rows in self._tables.items():
             self.add_info(f'{safe_name(name)}.csv', _csv(list(dict.fromkeys(k for r in rows for k in r)), rows))
         return {k: v for k, v in stats.items() if v['files'] or v['quarantine_items'] or v['events']}

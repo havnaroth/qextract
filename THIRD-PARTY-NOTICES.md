@@ -14,6 +14,7 @@ database, which draws on KapeFiles and ForensicArtifacts.
 | libvhdi-python (libvhdi) | LGPL-3.0-or-later | https://github.com/libyal/libvhdi |
 | libvmdk-python (libvmdk) | LGPL-3.0-or-later | https://github.com/libyal/libvmdk |
 | libevtx-python (libevtx) | LGPL-3.0-or-later | https://github.com/libyal/libevtx |
+| libregf-python (libregf) | LGPL-3.0-or-later | https://github.com/libyal/libregf |
 | pyzipper | MIT | https://github.com/danifus/pyzipper |
 | pycryptodomex | BSD-2-Clause and public domain | https://github.com/Legrandin/pycryptodome |
 | olefile | BSD-2-Clause | https://github.com/decalage2/olefile |

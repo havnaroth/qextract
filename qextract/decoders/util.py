@@ -193,11 +193,13 @@ def recovered(ctx, row, content, expected=None, name=None):
     row.update(hashes, size=len(content))
     # without a stored hash (or with a size only: a wrong XOR / RC4 key gives a file of the same
     # length) the file is also checked for looking like its type
+    # verified_by / warning: the same as status, as values a report can filter on
     if expected is None or expected[1] in (None, ''):
-        status, weak = 'recovered (not verified', True
+        status, weak, row['verified_by'] = 'recovered (not verified', True, 'none'
     else:
         kind, value = expected
         ok = (len(content) == int(value)) if kind == 'size' else (hashes[kind] == str(value).lower())
+        row['verified_by'] = kind if ok else f'{kind} mismatch'
         if not ok:
             status, weak = f'recovered ({kind.upper()} differs from the stored one)', False
         elif kind == 'size':
@@ -208,6 +210,7 @@ def recovered(ctx, row, content, expected=None, name=None):
         doubt = plausibility(content, row.get('original_path') or name or '')
         status += f'; {doubt})' if doubt else ')'
         if doubt:
+            row['warning'] = doubt
             ctx.warn(f'{row.get("container", "")}: {doubt} - either the file does not match its name '
                      '(e.g. a fake extension) or the decoding is wrong (e.g. a changed key)')
     row['status'] = status

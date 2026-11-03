@@ -40,7 +40,7 @@ COLUMNS = {
     'Threat Name': 'threat', 'Path': 'path', 'Action Name': 'action', 'Process Name': 'process',
     'Detection User': 'user', 'User': 'user',
 }
-DETAIL_FIELDS = ('Detection Time', 'Severity Name', 'Category Name', 'Source Name', 'Execution Name',
+DETAIL_FIELDS = ('Action ID', 'Detection Time', 'Severity Name', 'Category Name', 'Source Name', 'Execution Name',
                  'Error Description',
                  'Remediation User', 'Old Value', 'New Value', 'Feature Name', 'Reason', 'Scan Type',
                  'Scan Parameters', 'Scan ID', 'ID', 'Detection ID', 'Threat ID', 'SHA256', 'Hashes',

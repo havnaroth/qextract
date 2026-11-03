@@ -1,6 +1,7 @@
 """Command line: qextract -i <image or folder> -o <output folder>"""
 
 import argparse
+import collections
 import contextlib
 import datetime
 import hashlib
@@ -10,8 +11,9 @@ import re
 import sys
 import time
 
-from . import __version__, elevate, update
+from . import __version__, elevate, report, update
 from .collect import DEFAULT_MAX_DECODE_BYTES, Collector, SafeWriter, human_size
+from .host import public
 from .evidence import drive_letter, input_locations, is_live, open_input, volume_read_only
 from .output import OutputFolder, UnsafeOutput, is_link, resolved, shown, within
 from .sources import BUILTIN_DIR, exe_sources_dir, load_sources
@@ -33,6 +35,8 @@ output: one zip, qextract_recovered_<UTC start time>.zip (e.g. ..._20261101_0930
         AES, password "infected" (always; nothing is written outside it):
         malware\\<product>\\    recovered quarantined files as <sha256>_<name>.infected
                               (+ <name>.metadata.txt for Defender)
+        info\\summary.txt          start here: host, products, incidents, recovered files
+        info\\incidents.csv        one row per threat on a file, all logs and quarantine joined
         info\\quarantine.csv       decoded quarantine entries (detection, original path, hashes)
         info\\detections.csv       timeline from the AV event logs and the Defender MPLog
         info\\mplog_processes.csv  Defender MPLog per-process lines (evidence of execution)
@@ -89,7 +93,12 @@ def main(argv=None):
                    help='copy matched .evtx files into files\\ (they can be gigabytes): ask = ask in the '
                         'console showing their size (default; without a console they are not copied). '
                         'The timeline is built from the evidence either way')
-    p.add_argument('--force', action='store_true', help='allow an output folder that is not empty')
+    p.add_argument('--force', action='store_true',
+                   help="override the safety checks that are the user's call: an output folder that is not "
+                        'empty, and the output on the scanned drive or inside the scanned folder (e.g. -i D: '
+                        '-o D:\\cases\\x; that folder is left out of the scan, but writing changes the input - '
+                        'not for evidence that must stay untouched). The protection against crafted evidence '
+                        '(links, outside parent disks, ...) stays on')
     p.add_argument('--password', metavar='PASSWORD',
                    help='password of the result zip instead of "infected" (the zip is always encrypted; '
                         'the password is not written to the log or the summary)')
@@ -176,11 +185,17 @@ def main(argv=None):
     # evidence disk. A live system (its Windows drive) may take its own results: that folder
     # is left out of the scan.
     live = is_live(args.input)
-    protected = [] if live else input_locations(args.input)
+    locations = input_locations(args.input)
+    on_input = next((root for root in locations if within(resolved(out), root)), None)
+    target = os.path.normcase(resolved(out)).rstrip('\\/')
+    if (live or args.force) and any(target == os.path.normcase(root).rstrip('\\/') for root in locations):
+        p.error(f'the output cannot be the input itself ({shown(on_input)}): give a folder inside it')
+    protected = [] if live or args.force else locations
     inside = next((root for root in protected if within(resolved(out), root)), None)
     if inside:
         p.error(f'output must not be inside the input ({shown(inside)}): the input is only ever read. '
-                'Choose an output folder on another drive or outside the input folder')
+                'Choose an output folder on another drive or outside the input folder, or use --force '
+                'to write onto the input on purpose')
     if not next_to_input and os.path.isdir(out) and os.listdir(out) and not args.force:
         p.error(f'output folder is not empty: {out} (use --force)')
     if _offer_elevation(args, out):
@@ -218,6 +233,9 @@ def main(argv=None):
         if warning:
             log(f'WARNING: {warning}')
     letter = drive_letter(args.input)
+    if on_input and args.force and not live:
+        log(f'WARNING: --force: the results are written onto the input ({shown(on_input)}); their folder is '
+            'left out of the scan, but the input is changed by the writing')
     if live:
         log('Live system: the results may go to the scanned drive; their folder is left out of the scan')
     elif letter:
@@ -230,7 +248,8 @@ def main(argv=None):
 
     summary = {'tool': f'qextract {__version__}', 'input': shown_input, 'mode': args.mode,
                'output': out, 'started': started, 'sources_loaded': len(selected), 'errors': list(errors),
-               'zip_password': 'custom (--password)' if args.password else 'infected', 'live_system': live}
+               'zip_password': 'custom (--password)' if args.password else 'infected', 'live_system': live,
+               'output_on_input': bool(on_input)}
     code = 0
 
     def decide_event_logs(count, size):
@@ -279,6 +298,10 @@ def main(argv=None):
         code = 1
     summary['warnings'] = collector.warnings
     summary['finished'] = _now()
+    summary['schema_version'] = report.SCHEMA_VERSION
+    summary['hosts'] = {vol: public(h) for vol, h in collector.hosts.items()}
+    summary['incidents'] = len(collector.incidents)
+    summary['timeline'] = dict(collections.Counter(r.get('category', 'other') for r in collector.detections))
 
     found = summary.get('found', {})
     log('')
@@ -303,6 +326,12 @@ def main(argv=None):
 
     try:
         try:
+            try:
+                text = report.summary_text(summary, collector.detections, collector.quarantine,
+                                           collector.incidents, collector.hosts)
+            except Exception as e:  # noqa: BLE001 - summary.json and the CSVs are still written
+                text = f'summary.txt could not be written: {type(e).__name__}: {e}\n'
+            collector.add_info('summary.txt', text)
             collector.add_info('summary.json', json.dumps(summary, indent=2, ensure_ascii=False))
             collector.add_info('qextract.log', '\n'.join(log_lines) + '\n')
         finally:

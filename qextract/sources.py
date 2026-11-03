@@ -6,6 +6,9 @@ Each *.json file describes one product:
   "id": "defender",                       unique; a file with the same id loaded later replaces it
   "name": "Microsoft Defender",
   "references": ["https://..."],          optional, where the locations come from
+  "markers": ["Program Files*/X/x.ini"],  optional, files only this product has: when products
+                                          share folders, a file matched by several goes to the
+                                          one whose markers are on that volume
   "artifacts": [
     {
       "name": "Quarantine",
@@ -58,6 +61,15 @@ def _validate(src):
     for key in ('id', 'name'):
         if not isinstance(src.get(key), str) or not src[key].strip():
             raise ValueError(f'"{key}" must be a non-empty string')
+    markers = src.setdefault('markers', [])
+    if not isinstance(markers, list) or not all(isinstance(p, str) and p.strip() for p in markers):
+        raise ValueError('"markers" must be a list of path strings')
+    for p in markers:
+        try:
+            for part in p.replace('\\', '/').split('/'):
+                _segment(part)
+        except re.error as e:
+            raise ValueError(f'bad marker pattern "{p}": {e}') from e
     arts = src.get('artifacts')
     if not isinstance(arts, list) or not arts:
         raise ValueError('"artifacts" must be a non-empty list')

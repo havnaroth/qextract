@@ -2,7 +2,7 @@
 
 ### qextract
 
-[![](https://img.shields.io/badge/Category-DFIR%20%2F%20Incident%20Response-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Language-Python%203.11-E5A505?style=flat-square&logo=python&logoColor=white)]() [![](https://img.shields.io/badge/Build%20script-PowerShell-E5A505?style=flat-square&logo=powershell&logoColor=white)]() [![](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Version-0.1.44-E5A505?style=flat-square&color=green)]() [![](https://img.shields.io/badge/License-All%20rights%20reserved-E5A505?style=flat-square&color=lightgrey)]()
+[![](https://img.shields.io/badge/Category-DFIR%20%2F%20Incident%20Response-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Language-Python%203.11-E5A505?style=flat-square&logo=python&logoColor=white)]() [![](https://img.shields.io/badge/Build%20script-PowerShell-E5A505?style=flat-square&logo=powershell&logoColor=white)]() [![](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Version-0.2.0-E5A505?style=flat-square&color=green)]() [![](https://img.shields.io/badge/License-All%20rights%20reserved-E5A505?style=flat-square&color=lightgrey)]()
 
 <br clear="left">
 
@@ -47,6 +47,9 @@ products you give it (see [Adding a product](#adding-a-product)); the release ex
 (qextract warns about a writable one). The output folder may not be inside a scanned
 folder or on a mounted image or evidence drive. A live system (its Windows drive) may keep
 its own results, e.g. `-i C: -o C:\cases\host01`; that folder is left out of the scan.
+Any other drive or folder takes its own results only with `--force` (e.g. `-i D: -o D:\cases\host01`,
+qextract run from that drive): the output folder is left out of the scan, `summary.json` records
+`output_on_input`, but writing changes the input - not for evidence that must stay untouched.
 
 **Products:**
 - *Sample collected*: the quarantine folder is copied into the zip;
@@ -69,7 +72,7 @@ its own results, e.g. `-i C: -o C:\cases\host01`; that folder is left out of the
 | Elastic Defend | ✅ | | ✅ |
 | Emsisoft | ✅ | ✅ 2026-11-02 | ✅ |
 | ESET | ✅ | ✅ 2026-11-02 | ✅ |
-| F-Secure / WithSecure | ✅ | ✅ 2026-11-02 | ✅ + event log |
+| F-Secure (consumer) | ✅ | | ✅ |
 | Fortect | | | ✅ |
 | FortiClient Endpoint Protection | ✅ | ✅ untested | |
 | G DATA | ✅ | ✅ untested | |
@@ -93,6 +96,7 @@ its own results, e.g. `-i C: -o C:\cases\host01`; that folder is left out of the
 | VIPRE | ✅ | | ✅ |
 | VMware Carbon Black | | | ✅ |
 | Webroot | | | ✅ |
+| WithSecure Elements EPP (business, ex F-Secure Business) | ✅ | ✅ 2026-11-02 | ✅ + event log |
 
 Plus the AV-related Windows event logs. `qextract.exe --list-sources` shows everything a build knows.
 
@@ -118,6 +122,7 @@ qextract.exe -i D:\cases\disk.E01 -o D:\cases\host01        disk image
 qextract.exe -i D:\cases\disk.E01                           result next to the image
 qextract.exe -i F: -o D:\cases\host01                       mounted image
 qextract.exe -i C: -o D:\out --event-logs copy --no-elevate in a script, no questions
+qextract.exe -i D: -o D:\cases\host01 --force               results on the scanned drive
 ```
 
 | Option | Meaning |
@@ -128,7 +133,7 @@ qextract.exe -i C: -o D:\out --event-logs copy --no-elevate in a script, no ques
 | `--include-deleted` | also collect deleted files still listed in the file system |
 | `--no-elevate` | do not offer to restart as administrator |
 | `--no-update-check` | do not ask GitHub for a newer version (see below) |
-| `--force` | allow an output folder that is not empty |
+| `--force` | override the safety checks that are your call: an output folder that is not empty, and the output on the scanned drive or inside the scanned folder (left out of the scan; changes the input, recorded as `output_on_input`). The protection against crafted evidence stays on |
 | `--password PASSWORD` | your own password for the archive instead of `infected` |
 | `-s DIR` | extra product definitions (JSON) |
 
@@ -146,13 +151,22 @@ network traffic matters (e.g. on a suspect machine), use `--no-update-check`.
 
 | In the zip | Content |
 |---|---|
+| `info\summary.txt` | **start here**: the host (computer, Windows, time zone), what each product left, the incidents, recovered files, warnings |
+| `info\incidents.csv` | one row per threat on one file (or AMSI scan, registry key): every log's events and the quarantine item joined, first / last seen, actions, recovered file |
 | `malware\<product>\` | the recovered files as `.infected` and, for Defender, a `.metadata.txt` next to each |
 | `info\quarantine.csv` | decoded items: detection, original path, dates, hashes; for Defender also the original file's times, owner and download URL |
-| `info\detections.csv` | one timeline from all AV logs, times in UTC |
+| `info\detections.csv` | one timeline from all AV logs, times in UTC; `category` (detection, response, tamper, config, scan, health, telemetry) separates detections from noise |
 | `info\mplog_processes.csv` | Defender per-process scan lines (evidence of execution) |
 | `info\collected_files.csv`, `info\files\` | every collected file with its hash, and the copies |
 | `info\decoded\` | readable forms of obfuscated logs and settings (e.g. RogueKiller `config.ini.json`) |
-| `info\summary.json`, `info\qextract.log` | what was searched, found and skipped |
+| `info\summary.json`, `info\qextract.log` | the summary for programs (`schema_version`), and the run |
+
+The CSVs keep their columns; normalized ones are appended for every product alike (report schema 2):
+`action_norm` (quarantined, deleted, blocked, cleaned, allowed, restored, failed, detected, none -
+language independent), `path_norm` (`\Device\HarddiskVolumeN`, `%SystemDrive%`, `\?\` and `amsi:_` resolved)
+with `path_type`, `log`, `sha256` / `md5` / `threat_family` / `severity` from the details, `details_json` and
+`incident`; quarantine.csv adds `quarantined_utc` (local times converted with the host's time zone rules
+from the registry), `recovery`, `verified_by` and `warning`.
 
 The evidence and the machine are both treated as hostile (crafted files, planted links
 while running as administrator).
@@ -179,6 +193,11 @@ A product is one JSON file. Put it in a folder and pass the folder with `-s`, or
 - `kind`: `quarantine`, `log`, `eventlog` or anything else (only a label in the report).
 - `decoder` / `parser` (optional): one of the built-in ones (`qextract.exe --list-sources`
   shows which product uses which), e.g. `"decoder": "defender"`.
+- `markers` (optional): files only this product has, e.g.
+  `"markers": ["Program Files*/F-Secure/PSB/SecurityProductInformation.ini"]`. A file belongs to
+  one product only: when several products match it (they share folders), it goes to the one
+  whose markers are on that disk, then to the one with the more specific path; otherwise to the
+  first, with a warning.
 - A definition with the `id` of a built-in product replaces it.
 
 Run as administrator, qextract does not read the `sources` folder next to the exe (anyone who
