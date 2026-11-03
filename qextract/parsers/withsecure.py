@@ -25,7 +25,7 @@ from ..decoders.util import filetime, open_sqlite
 from ..fs import error_text
 from . import evtx, parser
 
-PRODUCT = 'F-Secure / WithSecure'
+PRODUCT = 'WithSecure Elements EPP'
 NAMES = ('state.db', 'priority.db', 'eventspool.db')
 ACTIONS = {'del': 'delete', 'bl': 'block', 'dis': 'disinfect', 'ren': 'rename', 'quar': 'quarantine'}
 EVENTS = {'sp_evt_oas_alert': 'malware detected (file access)', 'sp_evt_amsi_alert': 'malware detected (AMSI)',

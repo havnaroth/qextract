@@ -1,4 +1,7 @@
-"""WithSecure / F-Secure quarantine (ProgramData\\F-Secure\\Quarantine\\Repository\\).
+"""WithSecure Elements EPP quarantine (ProgramData\\F-Secure\\Quarantine\\Repository\\).
+
+The business product still uses the F-Secure folder names. The consumer F-Secure app has not
+been checked in the lab: it is a separate product (fsecure) without this decoder.
 
 info\\<n>.xml is one item in plain XML, TAR\\<n>.tar (old-style tar, numbered members) its
 content. The key travels with each item, so no product key is needed. Two kinds (lab,
@@ -81,7 +84,7 @@ def _spyware_files(members):
     return files, values
 
 
-@decoder('fsecure')
+@decoder('withsecure')
 def decode(ctx, files, options):
     tars = {f.name[:-4].lower(): f for f in files if f.name.lower().endswith('.tar')}
     rows = []
