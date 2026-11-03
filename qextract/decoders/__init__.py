@@ -26,4 +26,4 @@ def decoder(name):
 
 
 from . import (avast, avira, bitdefender, defender, emsisoft, eset, forticlient, fsecure, gdata, kaspersky,  # noqa: E402,F401
-               malwarebytes, mcafee, superantispyware, symantec, xor)  # registers the built-in decoders
+               malwarebytes, mcafee, roguekiller, superantispyware, symantec, xor)  # registers the built-in decoders

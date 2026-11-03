@@ -82,7 +82,7 @@ its own results, e.g. `-i C: -o C:\cases\host01`; that folder is left out of the
 | Norton | ✅ | | ✅ |
 | Palo Alto Cortex XDR / Traps | | | ✅ |
 | Panda / WatchGuard | ✅ | | ✅ |
-| RogueKiller | | | ✅ |
+| RogueKiller / Adlice Protect (incl. portable) | ✅ | ✅ 2026-11-03 | ✅ + scan reports |
 | SecureAge | | | ✅ |
 | SentinelOne | ✅ | | ✅ |
 | Sophos | ✅ | | ✅ |
@@ -99,6 +99,12 @@ Plus the AV-related Windows event logs. `qextract.exe --list-sources` shows ever
 **Logs in the timeline:** Defender `Operational.evtx`, MPLog and MPDetection logs,
 `Application.evtx` (AV products, Security Center), Symantec event logs, WithSecure EDR store
 (`ATP\pstor\state.db`) and `FSecureUltralightSDK.evtx`: detections, including scripts blocked by AMSI.
+RogueKiller scan and removal reports: every scan, and detections the user left in place.
+
+The portable RogueKiller keeps its data in a `RogueKiller` folder next to the exe. qextract looks
+for it at the drive root, one folder deep (e.g. `C:\Tools`), under the users' Desktop, Downloads,
+Documents and Temp, and in ProgramData. For another place, pass a definition with that path
+(see Adding a product, `"decoder": "roguekiller"`).
 
 ## Usage
 
@@ -145,6 +151,7 @@ network traffic matters (e.g. on a suspect machine), use `--no-update-check`.
 | `info\detections.csv` | one timeline from all AV logs, times in UTC |
 | `info\mplog_processes.csv` | Defender per-process scan lines (evidence of execution) |
 | `info\collected_files.csv`, `info\files\` | every collected file with its hash, and the copies |
+| `info\decoded\` | readable forms of obfuscated logs and settings (e.g. RogueKiller `config.ini.json`) |
 | `info\summary.json`, `info\qextract.log` | what was searched, found and skipped |
 
 The evidence and the machine are both treated as hostile (crafted files, planted links
