@@ -2,9 +2,10 @@
 # Needs Python 3.11+ (py launcher) on the build machine only.
 # The location database (local\location_database.csv, not in git) is compiled into
 # qextract\sources first; without it the exe only knows the definitions passed with -s.
-# Checks first (a finding stops the build): the tests (when the tests folder is here),
-# ruff and bandit with the rules in pyproject.toml; afterwards the exe is scanned for the
-# private strings in local\private_patterns.txt (when that file is here).
+# On a developer machine (the tests folder is here) checks run first and a finding stops the
+# build: the tests, then ruff and bandit (local\requirements-dev.txt) with the rules in
+# pyproject.toml. Elsewhere it only builds. Afterwards the exe is scanned for the private
+# strings in local\private_patterns.txt (when that file is here).
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
@@ -15,14 +16,13 @@ function Invoke-Step([string]$Exe, [string[]]$Arguments) {
 
 if (-not (Test-Path .venv)) { Invoke-Step py @('-3.11', '-m', 'venv', '.venv') }
 $py = '.\.venv\Scripts\python.exe'
-Invoke-Step $py @('-m', 'pip', 'install', '-q', '-r', 'requirements-dev.txt')
+Invoke-Step $py @('-m', 'pip', 'install', '-q', '-r', 'requirements.txt', 'pyinstaller==6.22.3')
 if (Test-Path tests) {
+    Invoke-Step $py @('-m', 'pip', 'install', '-q', '-r', 'local\requirements-dev.txt')
     Invoke-Step $py @('-m', 'unittest', 'discover', '-s', 'tests', '-q')
-} else {
-    Write-Warning 'No tests folder: building without running the tests.'
+    Invoke-Step $py @('-m', 'ruff', 'check', '.')
+    Invoke-Step $py @('-m', 'bandit', '-q', '-c', 'pyproject.toml', '-r', 'qextract')
 }
-Invoke-Step $py @('-m', 'ruff', 'check', '.')
-Invoke-Step $py @('-m', 'bandit', '-q', '-c', 'pyproject.toml', '-r', 'qextract')
 if (Test-Path tools\locations.py) { Invoke-Step $py @('tools\locations.py') }
 
 $data = @()
