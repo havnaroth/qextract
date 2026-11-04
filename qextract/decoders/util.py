@@ -96,6 +96,19 @@ def decode_text(data, host=None):
         return data.decode('cp1252', errors='replace')
 
 
+
+def zone_fields(text):
+    """The Zone.Identifier stream ("Mark of the Web") -> {zone_id, host_url, referrer_url}:
+    where Windows recorded a downloaded file came from."""
+    out = {}
+    for line in str(text or '').replace(chr(0), '').splitlines():
+        key, _, value = line.partition('=')
+        column = {'zoneid': 'zone_id', 'hosturl': 'host_url', 'referrerurl': 'referrer_url'}.get(key.strip().lower())
+        if column and value.strip() and column not in out:
+            out[column] = value.strip()[:2048]
+    return out
+
+
 def plain_path(path):
     """'\\\\?\\C:\\x' -> 'C:\\x', '\\\\?\\UNC\\host\\x' -> '\\\\host\\x'."""
     if path.startswith('\\\\?\\UNC\\'):

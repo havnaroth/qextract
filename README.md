@@ -2,7 +2,7 @@
 
 ### qextract
 
-[![](https://img.shields.io/badge/Category-DFIR%20%2F%20Incident%20Response-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Language-Python%203.11-E5A505?style=flat-square&logo=python&logoColor=white)]() [![](https://img.shields.io/badge/Build%20script-PowerShell-E5A505?style=flat-square&logo=powershell&logoColor=white)]() [![](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Version-0.3.0-E5A505?style=flat-square&color=green)]() [![](https://img.shields.io/badge/License-All%20rights%20reserved-E5A505?style=flat-square&color=lightgrey)]()
+[![](https://img.shields.io/badge/Category-DFIR%20%2F%20Incident%20Response-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Language-Python%203.11-E5A505?style=flat-square&logo=python&logoColor=white)]() [![](https://img.shields.io/badge/Build%20script-PowerShell-E5A505?style=flat-square&logo=powershell&logoColor=white)]() [![](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Version-0.3.1-E5A505?style=flat-square&color=green)]() [![](https://img.shields.io/badge/License-All%20rights%20reserved-E5A505?style=flat-square&color=lightgrey)]()
 
 <br clear="left">
 
@@ -11,6 +11,18 @@
 qextract pulls antivirus quarantine files and AV logs out of disk images, drives and
 folders, decodes the quarantined files and builds one detection timeline. One Windows exe,
 nothing to install.
+
+It also scans the NTFS `$MFT` and `$UsnJrnl:$J` for every file a product detected or put in
+quarantine. It looks for other locations of the same file:
+- the record of a deleted file, until the record is reused;
+- copies of the file's entry kept in the folder index;
+- the moves and renames the file went through on the drive, as far back as the journal reaches.
+
+It also looks for where the file came from: the download URL, the page that linked to it and
+the security zone, read from the `Zone.Identifier` alternate data stream ("Mark of the Web").
+That stream is kept with the quarantined file or in the file's `$MFT` record, even after the
+file was deleted. Each incident then shows when the file arrived on the disk, how long it sat
+there before the first detection, and where it came from (see "File history" under [Usage](#usage)).
 
 ## Installation
 
@@ -164,7 +176,7 @@ network traffic matters (e.g. on a suspect machine), use `--no-update-check`.
 | In the zip | Content |
 |---|---|
 | `info\summary.txt` | **start here**: the host (computer, Windows, time zone), what each product left, the incidents, recovered files, warnings |
-| `info\incidents.csv` | one row per threat on one file (or AMSI scan, registry key): every log's events and the quarantine item joined, first / last seen, actions, recovered file |
+| `info\incidents.csv` | one row per threat on one file (or AMSI scan, registry key): every log's events and the quarantine item joined, first / last seen, each action with its time (`action_times`), recovered file, and the user context: the account the detection happened for (`user_context`, a person before SYSTEM), the profile the file was in, the owner of the quarantined file (SID resolved through the registry) and the process that touched it |
 | `malware\<product>\` | the recovered files as `.infected` and, for Defender, a `.metadata.txt` next to each |
 | `info\quarantine.csv` | decoded items: detection, original path, dates, hashes; for Defender also the original file's times, owner and download URL |
 | `info\detections.csv` | one timeline from all AV logs, times in UTC; `category` (detection, response, tamper, config, scan, health, telemetry) separates detections from noise |
@@ -172,7 +184,8 @@ network traffic matters (e.g. on a suspect machine), use `--no-update-check`.
 | `info\collected_files.csv`, `info\files\` | every collected file with its hash, and the copies |
 | `info\decoded\` | readable forms of obfuscated logs and settings (e.g. RogueKiller `config.ini.json`) |
 | `info\summary.json`, `info\qextract.log` | the summary for programs (`schema_version`), and the run |
-| `mft\file_records.csv`, `mft\usn_events.csv` | the NTFS history of the files the products named: their `$MFT` records (also deleted ones) with both time sets, and their `$UsnJrnl:$J` events |
+| `mft\file_records.csv`, `mft\usn_events.csv` | the NTFS history of the files the products named: their `$MFT` records (also deleted ones) with both time sets and the download origin (`Zone.Identifier`), and their `$UsnJrnl:$J` events |
+| `mft\file_moves.csv` | each file's way on the volume from the journal: created, moved / renamed (from, to), deleted |
 
 The CSVs keep their columns; normalized ones are appended for every product alike (report schema 2):
 `action_norm` (quarantined, deleted, blocked, cleaned, allowed, restored, failed, detected, none -
@@ -184,10 +197,17 @@ from the registry), `recovery`, `verified_by` and `warning`.
 **File history:** not every host has real-time protection and not every sample is detected on
 arrival. For every file a product named, qextract reads the whole `$MFT` once (also records of
 deleted files, until they are reused) and the `$UsnJrnl:$J`. The incident then shows
-`on_disk_since`, the evidence for it and the `dwell` time before the first detection;
+`on_disk_since` (when the file arrived there: `$FILE_NAME` created or the journal's file create;
+modified times are the age of the content - an unpacked or copied file keeps them - and are not
+used), the evidence for it and the `dwell` time before the first detection of that path;
 `summary.txt` lists the files that were on the disk a minute or more before their detection.
 `$STANDARD_INFORMATION` is easy to change (timestomping, but also restore and unpack tools),
-`$FILE_NAME` is set by the system: both are reported. It needs an NTFS image, a raw drive
+`$FILE_NAME` is set by the system: both are reported.
+The incident also shows where a downloaded file came from (`origin`: download URL, the page that
+linked to it, the zone - from the `Zone.Identifier` stream kept with the quarantined file or in the
+file's `$MFT` record, also of a deleted file) and the way it took on the drive (`journey`, e.g.
+created in Temp, moved to Downloads, moved to `C:\`), as far back as the journal reaches; a copy or
+a move from another drive starts a new file and is not followed. It needs an NTFS image, a raw drive
 (administrator) or a collection that holds `$MFT` / `$J`; it takes seconds on a workstation
 (2 million records about 10 s) and is turned off with `--no-file-history`. The journal is small:
 on a busy machine it covers hours or days.

@@ -164,7 +164,7 @@ class Collector:
     (reports, copied files, log, summary)."""
 
     def __init__(self, out, log, max_decode_bytes=DEFAULT_MAX_DECODE_BYTES, started=None, password=None,
-                 protected=(), zip_name=None, file_history=True):
+                 protected=(), zip_name=None, file_history=True, status=None):
         self.out = os.path.abspath(out)
         # the zip is always encrypted: a custom password may replace "infected", never remove it
         self.password = password.encode('utf-8') if password else ZIP_PASSWORD
@@ -176,6 +176,7 @@ class Collector:
         # the zip is created through it: links refused, never inside the (read-only) input
         self.output = OutputFolder(self.out, protected)
         self.log = log
+        self.status = status or (lambda what: None)   # the console's sign of life (progress.py)
         self.max_decode_bytes = max_decode_bytes
         self.warnings = []
         self._zip = self._zip_file = None
@@ -330,6 +331,7 @@ class Collector:
             roots = volume.roots()
             matches = []
             for source in sources:
+                self.status(f"searching {volume.name} for {source.get('name', source['id'])}")
                 t0 = time.monotonic()
                 for art in source['artifacts']:
                     matched = self._match(volume, art, roots)
@@ -377,7 +379,9 @@ class Collector:
                 drive = 'C:'
                 self.history['notes'].append(f'{volume.name}: no registry to tell the drive letter; taken as C:')
             try:
-                found, usn, notes = mft.history_for(volume, roots[0], drive, paths, self.log)
+                self.status(f'reading the $MFT / $UsnJrnl of {volume.name}')
+                found, usn, notes = mft.history_for(volume, roots[0], drive, paths, self.log,
+                                                    status=self.status)
             except (OSError, ValueError, TimeoutError) as err:
                 self.warn(f'{volume.name}: file history not read: {error_text(err)}')
                 continue
@@ -391,14 +395,44 @@ class Collector:
                                          'or a collection that holds $MFT')
             return
         first = mft.first_on_disk(records, events)
+        # dwell runs to the FIRST detection of the path: a file detected again months later (a new
+        # incident after the one-day gap) was not missed for months
+        first_detected = {}
         for inc in self.incidents:
-            known = first.get(str(inc.get('path', '')).lower())
+            key = str(inc.get('path', '')).lower()
+            if key and (key not in first_detected or inc.get('first_seen', '') < first_detected[key]):
+                first_detected[key] = inc.get('first_seen', '')
+        zones = {}
+        for r in records:
+            if r.get('target') and (r.get('host_url') or r.get('zone_id')):
+                zones.setdefault(r['target'].lower(), (r, 0 if r.get('state') == 'in use' else 1))
+                if r.get('state') == 'in use':
+                    zones[r['target'].lower()] = (r, 0)
+        for inc in self.incidents:
+            key = str(inc.get('path', '')).lower()
+            zone = zones.get(key)
+            if zone and not inc.get('origin'):
+                r = zone[0]
+                inc['origin'] = report.origin_text(r.get('zone_id'), r.get('host_url'), r.get('referrer_url'))
+                inc['origin_evidence'] = (f"Zone.Identifier in $MFT record {r.get('record')}"
+                                          + (' (deleted file)' if r.get('state') != 'in use' else ''))
+            known = first.get(key)
             if not known:
                 continue
             inc['on_disk_since'], inc['on_disk_evidence'] = known
-            inc['dwell'] = report.duration(known[0], inc.get('first_seen', ''))
+            if inc.get('first_seen', '') == first_detected.get(key):
+                inc['dwell'] = report.duration(known[0], inc.get('first_seen', ''))
+        moves, journeys = mft.file_moves(records, events)
+        for inc in self.incidents:
+            journey = journeys.get(str(inc.get('path', '')).lower())
+            if journey:
+                inc['journey'] = journey
+        self.history['moves'] = sum(1 for m in moves if m['step'] in ('moved', 'renamed'))
         self.add_member('mft/file_records.csv', _csv(mft.RECORD_COLUMNS, records, sort=False))
         self.add_member('mft/usn_events.csv', _csv(mft.USN_COLUMNS, events))
+        # always written, also empty: its absence would look like a missing step (summary.txt
+        # says what period the journal covers)
+        self.add_member('mft/file_moves.csv', _csv(mft.MOVE_COLUMNS, moves))
 
     def run(self, volumes, sources, copy_event_logs=None):
         """copy_event_logs: None = copy them, or a callable(count, total bytes) -> bool that
@@ -431,6 +465,7 @@ class Collector:
                                  f"time zone {h.get('time_zone', 'unknown')}{problem}")
                         break
                 for source, art, entries in work:
+                    self.status(f"copying / decoding {source['name']} - {art['name']} ({len(entries)} file(s))")
                     t_work = time.monotonic()
                     s = stats.setdefault(source['id'], {'name': source['name'], 'files': 0, 'bytes': 0,
                                                         'quarantine_items': 0, 'recovered': 0, 'events': 0})

@@ -14,6 +14,7 @@ import time
 from . import __version__, elevate, report, update
 from .collect import DEFAULT_MAX_DECODE_BYTES, Collector, SafeWriter, human_size
 from .host import public
+from .progress import Heartbeat
 from .evidence import drive_letter, input_locations, is_live, open_input, volume_read_only
 from .output import OutputFolder, UnsafeOutput, is_link, resolved, shown, within
 from .sources import BUILTIN_DIR, exe_sources_dir, load_sources
@@ -71,7 +72,8 @@ def main(argv=None):
 
     p = argparse.ArgumentParser(prog='qextract', epilog=EPILOG,
                                 formatter_class=argparse.RawDescriptionHelpFormatter,
-                                description='Extract antivirus quarantine and logs from a disk image or folder.')
+                                description=f'qextract {__version__} - extract antivirus quarantine and logs '
+                                            'from a disk image or folder.')
     p.add_argument('-i', '--input', help='disk image or folder to read')
     p.add_argument('-o', '--output', help='folder for the results (created if missing); may be left out for an '
                                           'image or ZIP file: the result is then <name>_qextract_<UTC time>.zip '
@@ -114,7 +116,8 @@ def main(argv=None):
                    help='do not ask GitHub whether a newer qextract exists (the exe asks by default, in the '
                         'background; nothing is downloaded). Use it where any network traffic matters')
     p.add_argument('--elevated', action='store_true', help=argparse.SUPPRESS)  # set by the restart
-    p.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
+    # the version is the first line of -h; -v / --version still print it, without a help entry
+    p.add_argument('-v', '--version', action='version', version=f'%(prog)s {__version__}', help=argparse.SUPPRESS)
     args = p.parse_args(argv)
     if args.max_decode_mb < 1:
         p.error('--max-decode-mb must be at least 1')
@@ -214,19 +217,24 @@ def main(argv=None):
     except OSError as e:                 # no rights, invalid name, disk not ready, ...
         p.error(f'cannot create the output folder {out}: {e.strerror or e}')
     log_lines = []          # the log goes into the zip (info/qextract.log) at the end
+    heartbeat = Heartbeat(write=lambda line: print(_CONTROL_CHARS.sub('?', line), flush=True))
 
     def log(message):
         # names from the evidence may carry line breaks or terminal escape sequences
         message = _CONTROL_CHARS.sub('?', message)
-        print(message)
+        print(message, flush=True)       # piped (Tee-Object, a log file): show it now, not at the end
         log_lines.append(message)
+        heartbeat.printed()
 
     started_at, t0 = run_started, time.monotonic()
     started = started_at.isoformat(timespec='seconds').replace('+00:00', 'Z')
     log(f'qextract {__version__} - {started}')
     log(f'Input:  {shown_input}')
     log(f'Output: {out}')
-    log(f'Sources: {len(selected)}')
+    db = database_stats(selected)
+    log(f"Location database: {db['locations']} locations, {db['products']} products "
+        f"({db['decoded']} with the quarantine decoded, {db['parsed']} with logs in the timeline)"
+        + (' - selected with --only' if args.only else ''))
     for e in errors:
         log(f'WARNING: {e}')
     for s in selected:
@@ -251,7 +259,8 @@ def main(argv=None):
                 '(qextract only reads it; other programs might not)')
 
     summary = {'tool': f'qextract {__version__}', 'input': shown_input, 'mode': args.mode,
-               'output': out, 'started': started, 'sources_loaded': len(selected), 'errors': list(errors),
+               'output': out, 'started': started, 'sources_loaded': len(selected), 'location_database': db,
+               'errors': list(errors),
                'zip_password': 'custom (--password)' if args.password else 'infected', 'live_system': live,
                'output_on_input': bool(on_input)}
     code = 0
@@ -263,10 +272,13 @@ def main(argv=None):
                 log(f'Event logs: {text} - not copied, there is no console to ask (--event-logs copy to copy them)')
                 summary['event_logs'] = 'not copied'
                 return False
+            heartbeat.pause()
             try:
                 answer = input(f'Copy event logs too? {text} [y/N]: ')
             except EOFError:
                 answer = ''
+            finally:
+                heartbeat.pause(False)
             copy = answer.strip().lower() in ('y', 'yes', 't', 'tak')
         else:
             copy = args.event_logs == 'copy'
@@ -277,12 +289,14 @@ def main(argv=None):
     try:
         collector = Collector(out, log, max_decode_bytes=args.max_decode_mb * 1024 * 1024, started=started_at,
                               password=args.password, protected=protected, zip_name=zip_name,
-                              file_history=not args.no_file_history)
+                              file_history=not args.no_file_history, status=heartbeat.status)
     except UnsafeOutput as e:
         p.error(str(e))
     except OSError as e:
         p.error(f'cannot write to the output folder {out}: {e.strerror or e}')
     summary['zip'] = collector.zip_name
+    heartbeat.status('opening the input')
+    heartbeat.start()
     try:
         volumes = open_input(args.input, args.include_deleted, log, args.mode, args.zip_password)
         for v in volumes:
@@ -301,6 +315,8 @@ def main(argv=None):
         log(f'ERROR: {type(e).__name__}: {e}')
         summary['errors'].append(str(e))
         code = 1
+    finally:
+        heartbeat.status('writing the reports')
     summary['warnings'] = collector.warnings
     summary['finished'] = _now()
     summary['schema_version'] = report.SCHEMA_VERSION
@@ -347,7 +363,23 @@ def main(argv=None):
     except OSError as e:     # e.g. the output disk is full: say so instead of a traceback
         print(f'ERROR: the zip could not be finished ({e.strerror or e}); its content is incomplete.')
         code = 1
+    finally:
+        heartbeat.stop()
     return _finish(args, code)
+
+
+GENERIC_SOURCES = {'windows-events'}     # read for every product: not a product of its own
+
+
+def database_stats(sources):
+    """What the loaded location database covers: locations (paths), products, and how many
+    products have their quarantine decoded / their logs turned into timeline rows."""
+    products = [s for s in sources if s.get('id') not in GENERIC_SOURCES]
+    arts = [(s, a) for s in sources for a in s.get('artifacts', [])]
+    return {'locations': sum(len(a.get('paths', [])) for _s, a in arts),
+            'products': len(products),
+            'decoded': sum(1 for s in products if any(a.get('decoder') for a in s.get('artifacts', []))),
+            'parsed': sum(1 for s in products if any(a.get('parser') for a in s.get('artifacts', [])))}
 
 
 def _zip_next_to(path, when):

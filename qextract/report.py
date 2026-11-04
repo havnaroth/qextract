@@ -26,8 +26,35 @@ DETECTION_EXTRA = ['category', 'log', 'action_norm', 'path_norm', 'path_type', '
 QUARANTINE_EXTRA = ['quarantined_utc', 'recovery', 'verified_by', 'warning', 'path_norm', 'incident']
 INCIDENT_COLUMNS = ['incident', 'first_seen', 'last_seen', 'path', 'path_type', 'threats', 'products',
                     'actions', 'events', 'logs', 'quarantined', 'recovered_files', 'sha256', 'users',
-                    'processes', 'volume', 'on_disk_since', 'on_disk_evidence', 'dwell']
+                    'processes', 'volume', 'on_disk_since', 'on_disk_evidence', 'dwell',
+                    'origin', 'origin_evidence', 'journey', 'user_context', 'profile', 'file_owner',
+                    'action_times']
 INCIDENT_GAP = datetime.timedelta(days=1)    # the same file detected again after a day: a new incident
+ZONES = {'0': 'local computer', '1': 'intranet', '2': 'trusted sites', '3': 'internet', '4': 'restricted sites'}
+
+
+_UNSAFE_TEXT = re.compile('[\x00-\x08\x0a-\x1f\x7f\x9b]')      # as cli._CONTROL_CHARS
+_URL_QUERY = re.compile(r'(https?://[^\s?;#]+)[?#][^\s;]*', re.IGNORECASE)
+
+
+def _short_urls(text):
+    """For summary.txt: a signed download link carries hundreds of characters of token after
+    '?'; the host and path are what a reader needs (the full URL stays in incidents.csv)."""
+    return _URL_QUERY.sub(lambda m: m.group(1) + '?...', str(text or ''))
+
+
+def origin_text(zone_id='', host_url='', referrer_url=''):
+    """Zone.Identifier ("Mark of the Web") as one readable value: where the file was downloaded
+    from, the page that linked to it, the zone. '' when there is nothing."""
+    zone_id, host_url, referrer_url = (str(x or '').strip() for x in (zone_id, host_url, referrer_url))
+    if not (zone_id or host_url or referrer_url):
+        return ''
+    parts = [host_url or '(no download URL recorded)']
+    if referrer_url and referrer_url != host_url:
+        parts.append(f'from page {referrer_url}')
+    if zone_id:
+        parts.append(f'zone {zone_id} ({ZONES[zone_id]})' if zone_id in ZONES else f'zone {zone_id}')
+    return '; '.join(parts)
 
 CATEGORIES = ('detection', 'response', 'tamper', 'config', 'scan', 'health', 'telemetry', 'other')
 # Defender "Action ID" (language independent, unlike "Action Name")
@@ -351,13 +378,86 @@ def _components(items):
     return sorted((sorted(g, key=lambda m: m[0]) for g in groups.values()), key=lambda g: g[0][0])
 
 
+WELL_KNOWN_SIDS = {'S-1-5-18': 'SYSTEM', 'S-1-5-19': 'LOCAL SERVICE', 'S-1-5-20': 'NETWORK SERVICE'}
+WELL_KNOWN_GROUPS = {'S-1-5-32-544': 'Administrators (group)', 'S-1-5-32-545': 'Users (group)',
+                     'S-1-1-0': 'Everyone', 'S-1-5-11': 'Authenticated Users',
+                     'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464': 'TrustedInstaller'}
+_PROFILE = re.compile(r'^[A-Za-z]:\\Users\\([^\\]+)\\', re.IGNORECASE)
+_SHARED_PROFILES = {'public', 'default', 'default user', 'all users'}
+
+
+def account(name):
+    """An account as the logs write it -> one spelling: the local system account has a name
+    in the system language ('NT AUTHORITY\\SYSTEM', 'ZARZĄDZANIE NT\\SYSTEM', 'SYSTEM', S-1-5-18)."""
+    name = str(name or '').strip()
+    if name.upper() in ('SYSTEM', 'S-1-5-18') or name.upper().endswith('\\SYSTEM'):
+        return 'SYSTEM'
+    return WELL_KNOWN_SIDS.get(name.upper(), name)
+
+
+def profile_of(path):
+    """C:\\Users\\<name>\\... -> <name> (not the shared profiles), else ''."""
+    m = _PROFILE.match(str(path or ''))
+    return m.group(1) if m and m.group(1).lower() not in _SHARED_PROFILES else ''
+
+
+def owner_name(sid, profiles):
+    """A file owner SID -> the profile folder's name (ProfileList in the registry), else the SID."""
+    sid = str(sid or '').strip()
+    if not sid:
+        return ''
+    if sid.upper() in WELL_KNOWN_SIDS:
+        return WELL_KNOWN_SIDS[sid.upper()]
+    if sid.upper() in WELL_KNOWN_GROUPS:
+        return f'{WELL_KNOWN_GROUPS[sid.upper()]} ({sid})'
+    folder = (profiles or {}).get(sid, '')
+    return f"{folder.rstrip(chr(92)).rsplit(chr(92), 1)[-1]} ({sid})" if folder else sid
+
+
+def _user_context(events, quar, path, profiles):
+    """-> (user, profile, file owner): the account the detection happened for (a person before
+    SYSTEM - SYSTEM there is mostly the AV service or a scan), the profile the file was in, and
+    the owner of the quarantined file."""
+    users = list(dict.fromkeys(account(r.get('user')) for r in events if r.get('user')))
+    people = [u for u in users if u not in WELL_KNOWN_SIDS.values()]
+    if people:
+        user = '; '.join(people)
+    elif users:
+        user = f'{users[0]} (a service or a scan, not a person)'
+    else:
+        user = ''
+    owners = list(dict.fromkeys(owner_name(r.get('owner_sid'), profiles) for r in quar if r.get('owner_sid')))
+    return user, profile_of(path), '; '.join(owners)
+
+
+def _action_times(events, quar):
+    """Each action with the time it was first seen, per product: 'allowed' and 'quarantined'
+    minutes apart are two lines, not one 'allowed; quarantined'. -> [(ISO time, action, product)]"""
+    first = {}
+    for r in events:
+        action = r.get('action_norm')
+        if action and action not in ('none',):
+            key = (action, r.get('product', ''))
+            t = str(r.get('time') or '')
+            if t and (key not in first or t < first[key]):
+                first[key] = t
+    for r in quar:
+        key = ('quarantined', r.get('product') or r.get('source', ''))
+        t = str(r.get('quarantined_utc') or '')
+        if t and key not in first:
+            first[key] = t
+    real = {k: v for k, v in first.items() if k[0] != 'detected'}
+    chosen = real or first
+    return sorted(((t, a, p) for (a, p), t in chosen.items()), key=lambda x: (x[0], x[1]))
+
+
 def _actions(values):
     acts = {a for a in values if a}
     real = acts - {'none', 'detected'}
     return sorted(real) if real else sorted(acts & {'detected'})
 
 
-def build_incidents(detections, quarantine):
+def build_incidents(detections, quarantine, profiles=None):
     """Assigns row['incident'] and returns the incident rows (sorted by first time)."""
     rows = []
     for n, members in enumerate(_components(_items(detections, quarantine)), 1):
@@ -386,7 +486,13 @@ def build_incidents(detections, quarantine):
             'recovered_files': uniq(r.get('saved_as') for r in quar),
             'sha256': uniq([r.get('sha256') for r in quar] + [r.get('sha256') for r in events]),
             'users': uniq(r.get('user') for r in events), 'processes': uniq(r.get('process') for r in events),
-            'volume': uniq([r.get('volume') for r in events] + [r.get('volume') for r in quar])})
+            'volume': uniq([r.get('volume') for r in events] + [r.get('volume') for r in quar]),
+            **dict(zip(('user_context', 'profile', 'file_owner'), _user_context(events, quar, best[1], profiles),
+                       strict=True)),
+            'action_times': '; '.join(f'{t} {a} ({p})' if p else f'{t} {a}' for t, a, p in _action_times(events, quar)),
+            'origin': uniq(origin_text(r.get('zone_id'), r.get('host_url'), r.get('referrer_url')) for r in quar),
+            'origin_evidence': 'Zone.Identifier kept with the quarantined file'
+            if any(r.get('zone_id') or r.get('host_url') for r in quar) else ''})
     return rows
 
 
@@ -415,7 +521,8 @@ def normalize_all(detections, quarantine, hosts):
         normalize_detection(r, mapper, host.get('system_drive', system_drive))
     for r in quarantine:
         normalize_quarantine(r, hosts, mapper)
-    return build_incidents(detections, quarantine)
+    profiles = {sid: folder for h in hosts.values() for sid, folder in (h.get('profiles') or {}).items()}
+    return build_incidents(detections, quarantine, profiles)
 
 
 def _first(values):
@@ -424,6 +531,51 @@ def _first(values):
     if not parts:
         return '?'
     return parts[0] + (f' (+{len(parts) - 1})' if len(parts) > 1 else '')
+
+
+_ACTION_TIME = re.compile(r'(\S+) (\S+)(?: \((.*?)\))?(?:; |$)')
+
+
+def _field(label, value):
+    """'  label    value': one fact, one line, never broken (paths and URLs stay copyable)."""
+    return [f'  {label:<9}{value}']
+
+
+def _incident_block(inc):
+    """One incident as a labelled block: one fact per line, the path on a line of its own."""
+    out = [f"{inc['incident']}  {inc['first_seen'][:19].replace('T', ' ')} UTC  {_first(inc['threats'])}"]
+    out += _field('file', inc.get('path') or '?')
+    day = str(inc.get('first_seen', ''))[:10]
+    actions = _ACTION_TIME.findall(str(inc.get('action_times') or ''))
+    same_day = all(t[:10] == day for t, _a, _p in actions)
+    for n, (t, action, product) in enumerate(actions):
+        when = t[11:19] if same_day else t[:19].replace('T', ' ')
+        out.append(f"  {'actions' if n == 0 else '':<9}{when}  {action:<12} {product}".rstrip())
+    if inc.get('recovered_files'):
+        files = str(inc['recovered_files']).split('; ')
+        out += _field('recovered', 'malware\\' + files[0].rsplit('/', 1)[-1] + (f' (+{len(files) - 1})'
+                                                                              if len(files) > 1 else ''))
+    who = inc.get('user_context') or ''
+    if inc.get('profile'):
+        who += f"{'  ' if who else ''}(profile {inc['profile']})"
+    if who:
+        out += _field('user', who)
+    if inc.get('file_owner'):
+        out += _field('owner', inc['file_owner'])
+    process = str(inc.get('processes') or '').split('; ')[0]
+    if process and process.lower() != 'unknown':
+        itself = '  (the file itself ran)' if process.lower() == str(inc.get('path', '')).lower() else ''
+        more = str(inc.get('processes')).count('; ')
+        out += _field('process', process + itself + (f'  (+{more} more)' if more else ''))
+    if inc.get('origin'):
+        out += _field('origin', f"{_short_urls(inc['origin'])}  [{inc.get('origin_evidence', '')}]")
+    if inc.get('on_disk_since'):
+        dwell = f"  -  {inc['dwell']} before the detection" if inc.get('dwell') else ''
+        out += _field('on disk', f"since {inc['on_disk_since'][:19].replace('T', ' ')} UTC{dwell}  "
+                                 f"[{inc.get('on_disk_evidence', '')}]")
+    for n, hop in enumerate(str(inc.get('journey') or '').split(' -> ') if inc.get('journey') else []):
+        out.append(f"  {'journey' if n == 0 else '':<9}{hop}")
+    return out
 
 
 def _table(rows, columns):
@@ -441,6 +593,11 @@ def summary_text(summary, detections, quarantine, incidents, hosts, limit=40):
     out = [f"{summary.get('tool', 'qextract')} - report schema {SCHEMA_VERSION}",
            f"Started {summary.get('started', '')}, finished {summary.get('finished', '')}",
            f"Input:  {summary.get('input', '')} ({len(summary.get('volumes', []))} volume(s))"]
+    db = summary.get('location_database')
+    if isinstance(db, dict) and db:
+        out.append(f"Location database: {db.get('locations', 0)} locations, {db.get('products', 0)} products "
+                   f"({db.get('decoded', 0)} with the quarantine decoded, {db.get('parsed', 0)} with logs in the "
+                   'timeline)')
     if summary.get('output_on_input'):
         why = ('a live system keeping its own results' if summary.get('live_system')
                else '--force: the input was changed by the writing')
@@ -475,13 +632,12 @@ def summary_text(summary, detections, quarantine, incidents, hosts, limit=40):
         out.append('Timeline: ' + ', '.join(f'{noise[c]} {c}' for c in CATEGORIES if noise.get(c)))
         out.append('')
     out.append(f'Incidents ({len(incidents)}) - one threat on one file, all logs and quarantine joined (incidents.csv)')
-    rows = [[i['incident'], i['first_seen'][:19].replace('T', ' '), _first(i['threats']),
-             i['actions'] or '-', 'yes' if i['recovered_files'] else '', (i['path'] or '')]
-            for i in incidents[:limit]]
-    if rows:
-        out += _table(rows, ['id', 'first seen (UTC)', 'threat', 'actions', 'file', 'path'])
-        if len(incidents) > limit:
-            out.append(f'  ... {len(incidents) - limit} more in incidents.csv')
+    out.append('=' * 80)
+    for inc in incidents[:limit]:
+        out += _incident_block(inc)
+        out.append('')
+    if len(incidents) > limit:
+        out += [f'... {len(incidents) - limit} more in incidents.csv', '']
     out.append('')
     history = summary.get('file_history') or {}
     if history == 'off':
@@ -493,10 +649,14 @@ def summary_text(summary, detections, quarantine, incidents, hosts, limit=40):
         for note in history.get('notes', []):
             out.append(f'  {note}')
         if late:
-            out.append(f'  On the disk before the first detection ({len(late)}):')
-            rows = [[i['incident'], i['on_disk_since'][:19].replace('T', ' '), i['first_seen'][:19].replace('T', ' '),
-                     i['dwell'], i['path']] for i in late[:limit]]
-            out += _table(rows, ['id', 'on disk since (UTC)', 'first detected', 'dwell', 'path'])
+            out.append(f'  On the disk a minute or more before the first detection ({len(late)}): '
+                       + ', '.join(f"{i['incident']} ({i['dwell']})" for i in late))
+        moved = [i['incident'] for i in incidents if i.get('journey')]
+        if moved:
+            out.append(f'  Moved or renamed on the drive ({len(moved)}, mft\\file_moves.csv): ' + ', '.join(moved))
+        origins = [i['incident'] for i in incidents if i.get('origin')]
+        if origins:
+            out.append(f'  Download origin known ({len(origins)}, Zone.Identifier): ' + ', '.join(origins))
         out.append('')
     rec = [r for r in quarantine if r.get('saved_as')]
     password = ' - password "infected"' if summary.get('zip_password') == 'infected' else ''
@@ -520,4 +680,6 @@ def summary_text(summary, detections, quarantine, incidents, hosts, limit=40):
             '  quarantine.csv       quarantine items, hashes, recovered or not',
             '  collected_files.csv  every copied file; the copies are in files\\, decoded forms in decoded\\',
             '  summary.json         this summary for programs; qextract.log the run']
-    return '\n'.join(out) + '\n'
+    # paths, names, threat names and download URLs come from the evidence: a line break or a
+    # terminal escape sequence in them must not reach a console that shows this file
+    return '\n'.join(_UNSAFE_TEXT.sub('?', str(line)) for line in out) + '\n'
