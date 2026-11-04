@@ -553,8 +553,8 @@ def _incident_block(inc):
         out.append(f"  {'actions' if n == 0 else '':<9}{when}  {action:<12} {product}".rstrip())
     if inc.get('recovered_files'):
         files = str(inc['recovered_files']).split('; ')
-        out += _field('recovered', 'malware\\' + files[0].rsplit('/', 1)[-1] + (f' (+{len(files) - 1})'
-                                                                              if len(files) > 1 else ''))
+        out += _field('saved as', 'malware\\' + files[0].rsplit('/', 1)[-1] + (f' (+{len(files) - 1})'
+                                                                             if len(files) > 1 else ''))
     who = inc.get('user_context') or ''
     if inc.get('profile'):
         who += f"{'  ' if who else ''}(profile {inc['profile']})"
@@ -588,7 +588,7 @@ def _table(rows, columns):
     return lines
 
 
-def summary_text(summary, detections, quarantine, incidents, hosts, limit=40):
+def summary_text(summary, detections, quarantine, incidents, hosts):
     """The run for a human reader (info/summary.txt)."""
     out = [f"{summary.get('tool', 'qextract')} - report schema {SCHEMA_VERSION}",
            f"Started {summary.get('started', '')}, finished {summary.get('finished', '')}",
@@ -610,6 +610,9 @@ def summary_text(summary, detections, quarantine, incidents, hosts, limit=40):
             offset = f" ({p['utc_offset']})" if p.get('utc_offset') else ''
             problem = f"; {p['error']}" if p.get('error') else ''
             out.append(f"  time zone {p.get('time_zone', 'unknown')}{offset}{problem}")
+            for n in p.get('networks') or []:      # DHCP = the last lease in the registry (details in summary.json)
+                out.append(f"  network   {n.get('address', '?')} ({n.get('adapter', '?')}, "
+                           f"{'DHCP' if n.get('dhcp') else 'static'})")
     if any(hosts.values()):
         out.append('')
     found = summary.get('found', {})
@@ -633,11 +636,9 @@ def summary_text(summary, detections, quarantine, incidents, hosts, limit=40):
         out.append('')
     out.append(f'Incidents ({len(incidents)}) - one threat on one file, all logs and quarantine joined (incidents.csv)')
     out.append('=' * 80)
-    for inc in incidents[:limit]:
+    for inc in incidents:              # all of them: the summary is the report, not a teaser
         out += _incident_block(inc)
         out.append('')
-    if len(incidents) > limit:
-        out += [f'... {len(incidents) - limit} more in incidents.csv', '']
     out.append('')
     history = summary.get('file_history') or {}
     if history == 'off':
@@ -661,18 +662,18 @@ def summary_text(summary, detections, quarantine, incidents, hosts, limit=40):
     rec = [r for r in quarantine if r.get('saved_as')]
     password = ' - password "infected"' if summary.get('zip_password') == 'infected' else ''
     out.append(f'Recovered files ({len(rec)}) in malware\\{password}')
-    for r in rec[:limit]:
-        verified = r.get('verified_by') or ''
-        when = r.get('quarantined_utc') or r.get('quarantined') or ''
-        out.append(f"  {(r.get('detection') or '?')[:35]:35}  {when:20}  {verified[:22]:22}  "
-                   f"{r.get('path_norm') or r.get('original_path') or ''}")
+    if rec:
+        out += _table([[r.get('detection') or '?', str(r.get('quarantined_utc') or r.get('quarantined') or '')[:19]
+                        .replace('T', ' '), r.get('verified_by') or '-',
+                        r.get('path_norm') or r.get('original_path') or ''] for r in rec],
+                      ['detection', 'quarantined (UTC)', 'verified by', 'original path'])
     not_rec = [r for r in quarantine if r.get('recovery') != 'recovered']
     if not_rec:
         out.append(f'  not recovered: {len(not_rec)} (see quarantine.csv, status)')
     out.append('')
     warnings, errors = summary.get('warnings', []), summary.get('errors', [])
     out.append(f'Warnings ({len(warnings)})' + (':' if warnings else ''))
-    out += [f'  - {w}' for w in warnings[:limit]]
+    out += [f'  - {w}' for w in warnings]
     out.append(f'Errors: {"; ".join(errors) if errors else "none"}')
     out += ['', 'Files in this zip:',
             '  incidents.csv        start here: one row per threat on a file',

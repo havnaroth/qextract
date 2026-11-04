@@ -31,6 +31,52 @@ def _open(volume, path):
     return f, stream
 
 
+ADAPTER_CLASS = '{4D36E972-E325-11CE-BFC1-08002BE10318}'      # network adapters: their display names
+_IPV4 = re.compile(r'^(?:\d{1,3}\.){3}\d{1,3}$')
+_NO_ADDRESS = re.compile(r'^0+\.0+\.0+\.0+$')      # what the registry keeps for "no address"
+
+
+def _strings(key, name):
+    """A REG_SZ or REG_MULTI_SZ value as a list of strings (IP addresses are stored both ways)."""
+    v = _value(key, name)
+    if isinstance(v, bytes):
+        v = v[:4096].decode('utf-16-le', 'replace').split('\0')
+    elif isinstance(v, str):
+        v = v.replace(',', ' ').split()
+    else:
+        return []
+    return [s.strip() for s in v if s.strip()]
+
+
+def _networks(system, cs):
+    """Every adapter with an IPv4 address: static (IPAddress) or the last DHCP lease (DhcpIPAddress,
+    which may be older than the detection). -> [{adapter, address, dhcp, mask, gateway, dns,
+    dhcp_server, lease_obtained, lease_expires}]"""
+    out = []
+    ifs = system.get_key_by_path(fr'\{cs}\Services\Tcpip\Parameters\Interfaces')
+    for i in range(min(ifs.number_of_sub_keys, 256) if ifs is not None else 0):
+        key = ifs.get_sub_key(i)
+        guid = key.name or ''
+        conn = system.get_key_by_path(fr'\{cs}\Control\Network\{ADAPTER_CLASS}\{guid}\Connection') \
+            if re.fullmatch(r'\{[0-9A-Fa-f-]{36}\}', guid) else None
+        adapter = str(_value(conn, 'Name') or guid)[:100]
+        static = [a for a in _strings(key, 'IPAddress') if _IPV4.match(a) and not _NO_ADDRESS.match(a)]
+        leased = [a for a in _strings(key, 'DhcpIPAddress') if _IPV4.match(a) and not _NO_ADDRESS.match(a)]
+        for address, by_dhcp in [(a, False) for a in static] + [(a, True) for a in leased if a not in static]:
+            entry = {'adapter': adapter, 'address': address, 'dhcp': by_dhcp,
+                     'mask': ', '.join(_strings(key, 'DhcpSubnetMask' if by_dhcp else 'SubnetMask')),
+                     'gateway': ', '.join(_strings(key, 'DhcpDefaultGateway' if by_dhcp else 'DefaultGateway')),
+                     'dns': ', '.join(_strings(key, 'DhcpNameServer' if by_dhcp else 'NameServer'))}
+            if by_dhcp:
+                entry['dhcp_server'] = ', '.join(_strings(key, 'DhcpServer'))
+                for name, column in (('LeaseObtainedTime', 'lease_obtained'), ('LeaseTerminatesTime', 'lease_expires')):
+                    t = _value(key, name)
+                    if isinstance(t, int) and 0 < t < 1 << 33:
+                        entry[column] = datetime.datetime.fromtimestamp(t, datetime.UTC).isoformat()[:19] + 'Z'
+            out.append(entry)
+    return out
+
+
 def _value(key, name):
     if key is None:
         return None
@@ -84,6 +130,9 @@ def read_host(volume, root=''):
             active = _value(tzkey, 'ActiveTimeBias')
             if isinstance(active, int):
                 host['active_bias_minutes'] = active - (1 << 32) if active >= 1 << 31 else active
+            networks = _networks(system, cs)
+            if networks:
+                host['networks'] = networks
         if software is not None:
             cv = software.get_key_by_path(r'\Microsoft\Windows NT\CurrentVersion')
             product, build = _value(cv, 'ProductName') or '', str(_value(cv, 'CurrentBuild') or '')
