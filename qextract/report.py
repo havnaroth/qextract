@@ -26,7 +26,7 @@ DETECTION_EXTRA = ['category', 'log', 'action_norm', 'path_norm', 'path_type', '
 QUARANTINE_EXTRA = ['quarantined_utc', 'recovery', 'verified_by', 'warning', 'path_norm', 'incident']
 INCIDENT_COLUMNS = ['incident', 'first_seen', 'last_seen', 'path', 'path_type', 'threats', 'products',
                     'actions', 'events', 'logs', 'quarantined', 'recovered_files', 'sha256', 'users',
-                    'processes', 'volume']
+                    'processes', 'volume', 'on_disk_since', 'on_disk_evidence', 'dwell']
 INCIDENT_GAP = datetime.timedelta(days=1)    # the same file detected again after a day: a new incident
 
 CATEGORIES = ('detection', 'response', 'tamper', 'config', 'scan', 'health', 'telemetry', 'other')
@@ -46,6 +46,20 @@ _DETAIL_SPLIT = re.compile(r'; (?=[A-Za-z][A-Za-z0-9 ()/_.-]{0,40}: )')
 _DEVICE = re.compile(r'^\\Device\\HarddiskVolume(\d+)(\\.*)$', re.IGNORECASE)
 _MULTI = re.compile(r';\s*(?=(?:file:_|amsi:_|process:_|regkey|[A-Za-z]:\\|\\Device\\|%))')
 _DEFENDER_NAME = re.compile(r'^[A-Za-z]+:[A-Za-z0-9]+/([A-Za-z0-9_-]+)')
+
+
+def duration(start, end):
+    """'3 d 4 h', '17 h 5 min', '42 s' between two ISO UTC times; '' when end is not later."""
+    a, b = _time(start), _time(end)
+    if a is None or b is None or b <= a:
+        return ''
+    s = int((b - a).total_seconds())
+    d, h, m = s // 86400, s % 86400 // 3600, s % 3600 // 60
+    if d:
+        return f'{d} d {h} h'
+    if h:
+        return f'{h} h {m} min'
+    return f'{m} min' if m else f'{s} s'
 
 
 def _time(value):
@@ -80,7 +94,7 @@ def category(row):
         return 'health'
     if 'disabled' in event or 'tamper' in event or 'history deleted' in event:
         return 'tamper'
-    if 'engine failed' in event or 'protection failed' in event:
+    if 'engine failed' in event or 'protection failed' in event or 'protection component stopped' in event:
         return 'health'
     if 'configuration' in event or 'exclusion' in event or 'enabled' in event:
         return 'config'
@@ -365,7 +379,7 @@ def build_incidents(detections, quarantine):
             'first_seen': members[0][0].isoformat() + 'Z', 'last_seen': members[-1][0].isoformat() + 'Z',
             'path': best[1], 'path_type': best[2] if best[1] else '',
             'threats': uniq([r.get('threat') for r in events] + [r.get('detection') for r in quar]),
-            'products': uniq([r.get('product') for r in events] + [r.get('source') for r in quar]),
+            'products': uniq([r.get('product') for r in events] + [r.get('product') or r.get('source') for r in quar]),
             'actions': uniq(actions), 'events': len(events),
             'logs': uniq(sorted({r.get('log') for r in events})),
             'quarantined': 'yes' if quar or 'quarantined' in actions else '',
@@ -376,6 +390,19 @@ def build_incidents(detections, quarantine):
     return rows
 
 
+def local_time_to_utc(row, host):
+    """A parser of a log in local time writes '<ISO> (local time)'; with the host's time zone
+    that becomes UTC like every other row, and the original goes into details. Without the
+    time zone the row keeps its local time (marked as such)."""
+    when = str(row.get('time', '') or '')
+    if not when.endswith('(local time)'):
+        return
+    utc = hostinfo.to_utc(host, when)
+    if utc:
+        row['time'] = utc
+        row['details'] = '; '.join(x for x in (str(row.get('details') or ''), f'local time: {when[:-13]}') if x)
+
+
 def normalize_all(detections, quarantine, hosts):
     """Everything in place; returns the incident rows."""
     system_drive = next((h.get('system_drive') for h in hosts.values() if h.get('system_drive')), 'C:')
@@ -383,23 +410,26 @@ def normalize_all(detections, quarantine, hosts):
     flat = [p for raw in paths for p in re.split(r';\s*', str(raw or '')) if p]
     mapper = PathMapper(flat, system_drive)
     for r in detections:
-        drive = hosts.get(r.get('volume'), {}).get('system_drive', system_drive)
-        normalize_detection(r, mapper, drive)
+        host = hosts.get(r.get('volume'), {})
+        local_time_to_utc(r, host)
+        normalize_detection(r, mapper, host.get('system_drive', system_drive))
     for r in quarantine:
         normalize_quarantine(r, hosts, mapper)
     return build_incidents(detections, quarantine)
 
 
-def _cut(text, width, end=False):
-    """At most width characters; a path keeps its end (the file name), other text its start."""
-    text = str(text)
-    if len(text) <= width:
-        return text
-    return '...' + text[-(width - 3):] if end else text[:width - 3] + '...'
+def _first(values):
+    """'a; b; c' -> 'a (+2)': whole names, the full list stays in the CSV."""
+    parts = [v for v in str(values or '').split('; ') if v]
+    if not parts:
+        return '?'
+    return parts[0] + (f' (+{len(parts) - 1})' if len(parts) > 1 else '')
 
 
 def _table(rows, columns):
+    """Aligned columns; the last one (the full path) is never padded or cut."""
     widths = [max([len(str(c))] + [len(str(r[i])) for r in rows]) for i, c in enumerate(columns)]
+    widths[-1] = 0
     lines = ['  ' + '  '.join(str(c).ljust(w) for c, w in zip(columns, widths, strict=True))]
     for r in rows:
         lines.append('  ' + '  '.join(str(v).ljust(w) for v, w in zip(r, widths, strict=True)))
@@ -445,14 +475,29 @@ def summary_text(summary, detections, quarantine, incidents, hosts, limit=40):
         out.append('Timeline: ' + ', '.join(f'{noise[c]} {c}' for c in CATEGORIES if noise.get(c)))
         out.append('')
     out.append(f'Incidents ({len(incidents)}) - one threat on one file, all logs and quarantine joined (incidents.csv)')
-    rows = [[i['incident'], i['first_seen'][:19].replace('T', ' '), _cut(i['threats'] or '?', 40),
-             i['actions'] or '-', 'yes' if i['recovered_files'] else '', _cut(i['path'] or '', 70, end=True)]
+    rows = [[i['incident'], i['first_seen'][:19].replace('T', ' '), _first(i['threats']),
+             i['actions'] or '-', 'yes' if i['recovered_files'] else '', (i['path'] or '')]
             for i in incidents[:limit]]
     if rows:
         out += _table(rows, ['id', 'first seen (UTC)', 'threat', 'actions', 'file', 'path'])
         if len(incidents) > limit:
             out.append(f'  ... {len(incidents) - limit} more in incidents.csv')
     out.append('')
+    history = summary.get('file_history') or {}
+    if history == 'off':
+        out += ['File history ($MFT / $UsnJrnl): off (--no-file-history)', '']
+    elif isinstance(history, dict) and history:
+        late = [i for i in incidents if i.get('dwell') and not str(i['dwell']).endswith(' s')]   # a minute or more
+        out.append(f"File history ($MFT / $UsnJrnl, mft\\): {history.get('records', 0)} file record(s), "
+                   f"{history.get('usn_events', 0)} journal event(s), {history.get('seconds', 0)} s")
+        for note in history.get('notes', []):
+            out.append(f'  {note}')
+        if late:
+            out.append(f'  On the disk before the first detection ({len(late)}):')
+            rows = [[i['incident'], i['on_disk_since'][:19].replace('T', ' '), i['first_seen'][:19].replace('T', ' '),
+                     i['dwell'], i['path']] for i in late[:limit]]
+            out += _table(rows, ['id', 'on disk since (UTC)', 'first detected', 'dwell', 'path'])
+        out.append('')
     rec = [r for r in quarantine if r.get('saved_as')]
     password = ' - password "infected"' if summary.get('zip_password') == 'infected' else ''
     out.append(f'Recovered files ({len(rec)}) in malware\\{password}')

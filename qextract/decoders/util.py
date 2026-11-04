@@ -81,6 +81,21 @@ def unixtime(value):
         return ''
 
 
+def decode_text(data, host=None):
+    """Text of a log: UTF-16 with a BOM, UTF-8, else the system ANSI code page (host.py reads it
+    from the registry; cp1252 when unknown)."""
+    if data[:2] in (b'\xff\xfe', b'\xfe\xff'):
+        return data.decode('utf-16', errors='replace')
+    try:
+        return data.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        pass
+    try:
+        return data.decode((host or {}).get('ansi_codepage') or 'cp1252')
+    except (LookupError, UnicodeDecodeError):
+        return data.decode('cp1252', errors='replace')
+
+
 def plain_path(path):
     """'\\\\?\\C:\\x' -> 'C:\\x', '\\\\?\\UNC\\host\\x' -> '\\\\host\\x'."""
     if path.startswith('\\\\?\\UNC\\'):
@@ -128,12 +143,59 @@ def guard(rows, entry):
                      'status': f'error: {type(e).__name__}: {e}'[:500]})
 
 
-def open_sqlite(data):
+_WAL_MAGIC = (0x377F0682, 0x377F0683)
+WAL_MAX_PAGES = 1 << 20          # a crafted -wal must not grow the database without bound
+
+
+def apply_wal(data, wal):
+    """The pages of the committed transactions in a -wal file written into a copy of the
+    database, as SQLite itself would on a checkpoint (nothing on the evidence changes).
+    Frames after the last commit, or left from an older WAL generation (other salts), are
+    ignored. Checksums are not verified: the salts already tie a frame to this generation.
+    -> (bytearray, number of committed frames applied)."""
+    db = bytearray(data)
+    if len(wal) < 32 or struct.unpack_from('>I', wal, 0)[0] not in _WAL_MAGIC:
+        return db, 0
+    page_size = struct.unpack_from('>I', wal, 8)[0]
+    if page_size == 1:
+        page_size = 65536
+    if page_size < 512 or page_size > 65536 or page_size & (page_size - 1):
+        return db, 0
+    salts = wal[16:24]
+    committed, pending, size = {}, {}, None
+    offset, applied = 32, 0
+    # every page of the result is in the database or in the WAL: a page number or database
+    # size beyond both is crafted (it would make us allocate gigabytes)
+    max_pages = min(WAL_MAX_PAGES, (len(db) + len(wal)) // page_size + 1)
+    while offset + 24 + page_size <= len(wal):
+        pgno, commit = struct.unpack_from('>II', wal, offset)
+        if wal[offset + 8:offset + 16] != salts or not 0 < pgno <= max_pages or commit > max_pages:
+            break
+        pending[pgno] = offset + 24
+        if commit:
+            committed.update(pending)
+            applied += len(pending)
+            pending, size = {}, commit
+        offset += 24 + page_size
+    if size is None:
+        return db, 0
+    if len(db) < size * page_size:
+        db.extend(bytes(size * page_size - len(db)))
+    for pgno, start in committed.items():
+        db[(pgno - 1) * page_size:pgno * page_size] = wal[start:start + page_size]
+    del db[size * page_size:]
+    return db, applied
+
+
+def open_sqlite(data, wal=None):
     """An SQLite database from the evidence: in memory, read-only, schema not trusted
     (no functions from views or triggers), text that is not UTF-8 kept instead of failing.
     A database in WAL mode (header bytes 18-19 = 2) cannot be opened from memory, so the copy
-    is switched to rollback mode; what is still only in the -wal file next to it is not read."""
+    is switched to rollback mode; give the -wal file next to it as wal to read its committed
+    transactions too (otherwise what is still only there is not read)."""
     data = bytearray(data)
+    if wal:
+        data, _frames = apply_wal(data, wal)
     if data[18:20] == b'\x02\x02':
         data[18:20] = b'\x01\x01'
     con = sqlite3.connect(':memory:')

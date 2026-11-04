@@ -2,7 +2,7 @@
 
 ### qextract
 
-[![](https://img.shields.io/badge/Category-DFIR%20%2F%20Incident%20Response-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Language-Python%203.11-E5A505?style=flat-square&logo=python&logoColor=white)]() [![](https://img.shields.io/badge/Build%20script-PowerShell-E5A505?style=flat-square&logo=powershell&logoColor=white)]() [![](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Version-0.2.0-E5A505?style=flat-square&color=green)]() [![](https://img.shields.io/badge/License-All%20rights%20reserved-E5A505?style=flat-square&color=lightgrey)]()
+[![](https://img.shields.io/badge/Category-DFIR%20%2F%20Incident%20Response-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Language-Python%203.11-E5A505?style=flat-square&logo=python&logoColor=white)]() [![](https://img.shields.io/badge/Build%20script-PowerShell-E5A505?style=flat-square&logo=powershell&logoColor=white)]() [![](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Version-0.3.0-E5A505?style=flat-square&color=green)]() [![](https://img.shields.io/badge/License-All%20rights%20reserved-E5A505?style=flat-square&color=lightgrey)]()
 
 <br clear="left">
 
@@ -104,6 +104,17 @@ Plus the AV-related Windows event logs. `qextract.exe --list-sources` shows ever
 `Application.evtx` (AV products, Security Center), Symantec event logs, WithSecure EDR store
 (`ATP\pstor\state.db`) and `FSecureUltralightSDK.evtx`: detections, including scripts blocked by AMSI.
 RogueKiller scan and removal reports: every scan, and detections the user left in place.
+Avast / AVG: `Log.db` (detections, scan sessions), the shield reports in `report\*.txt` (local
+time, converted to UTC with the time zone from the registry) and the notifications shown to the
+user (`NCcache.dat`, with whether the user opened them).
+SUPERAntiSpyware: the scan logs and the application logs (`AppLogs\*.SDB`, decoded): scans,
+detections with the rule number, and every quarantined file with its MD5.
+Emsisoft: `logs.db3` (scans, detections with SHA1, quarantine, settings changes, protection
+problems) and the scan reports in `Reports\scan_*.txt`, which are the only record of files
+quarantined at the end of a scan.
+Kaspersky: `Data\reports.db` with its `-wal` file (most of the data is only there): every
+detection with the process that touched the file, MD5, quarantine and deletion; protection
+components started and stopped; sign-ins to the My Kaspersky portal.
 
 The portable RogueKiller keeps its data in a `RogueKiller` folder next to the exe. qextract looks
 for it at the drive root, one folder deep (e.g. `C:\Tools`), under the users' Desktop, Downloads,
@@ -133,6 +144,7 @@ qextract.exe -i D: -o D:\cases\host01 --force               results on the scann
 | `--include-deleted` | also collect deleted files still listed in the file system |
 | `--no-elevate` | do not offer to restart as administrator |
 | `--no-update-check` | do not ask GitHub for a newer version (see below) |
+| `--no-file-history` | skip the `$MFT` / `$UsnJrnl` history of the detected files (see `mft\` below) |
 | `--force` | override the safety checks that are your call: an output folder that is not empty, and the output on the scanned drive or inside the scanned folder (left out of the scan; changes the input, recorded as `output_on_input`). The protection against crafted evidence stays on |
 | `--password PASSWORD` | your own password for the archive instead of `infected` |
 | `-s DIR` | extra product definitions (JSON) |
@@ -160,13 +172,25 @@ network traffic matters (e.g. on a suspect machine), use `--no-update-check`.
 | `info\collected_files.csv`, `info\files\` | every collected file with its hash, and the copies |
 | `info\decoded\` | readable forms of obfuscated logs and settings (e.g. RogueKiller `config.ini.json`) |
 | `info\summary.json`, `info\qextract.log` | the summary for programs (`schema_version`), and the run |
+| `mft\file_records.csv`, `mft\usn_events.csv` | the NTFS history of the files the products named: their `$MFT` records (also deleted ones) with both time sets, and their `$UsnJrnl:$J` events |
 
 The CSVs keep their columns; normalized ones are appended for every product alike (report schema 2):
 `action_norm` (quarantined, deleted, blocked, cleaned, allowed, restored, failed, detected, none -
-language independent), `path_norm` (`\Device\HarddiskVolumeN`, `%SystemDrive%`, `\?\` and `amsi:_` resolved)
+language independent), `path_norm` (`\Device\HarddiskVolumeN`, `%SystemDrive%`, `\\?\` and `amsi:_` resolved)
 with `path_type`, `log`, `sha256` / `md5` / `threat_family` / `severity` from the details, `details_json` and
 `incident`; quarantine.csv adds `quarantined_utc` (local times converted with the host's time zone rules
 from the registry), `recovery`, `verified_by` and `warning`.
+
+**File history:** not every host has real-time protection and not every sample is detected on
+arrival. For every file a product named, qextract reads the whole `$MFT` once (also records of
+deleted files, until they are reused) and the `$UsnJrnl:$J`. The incident then shows
+`on_disk_since`, the evidence for it and the `dwell` time before the first detection;
+`summary.txt` lists the files that were on the disk a minute or more before their detection.
+`$STANDARD_INFORMATION` is easy to change (timestomping, but also restore and unpack tools),
+`$FILE_NAME` is set by the system: both are reported. It needs an NTFS image, a raw drive
+(administrator) or a collection that holds `$MFT` / `$J`; it takes seconds on a workstation
+(2 million records about 10 s) and is turned off with `--no-file-history`. The journal is small:
+on a busy machine it covers hours or days.
 
 The evidence and the machine are both treated as hostile (crafted files, planted links
 while running as administrator).
