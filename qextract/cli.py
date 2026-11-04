@@ -12,7 +12,7 @@ import sys
 import time
 
 from . import __version__, elevate, report, update
-from .collect import DEFAULT_MAX_DECODE_BYTES, Collector, SafeWriter, human_size
+from .collect import DEFAULT_MAX_DECODE_BYTES, GENERIC_SOURCES, Collector, SafeWriter, human_size
 from .host import public
 from .progress import Heartbeat
 from .evidence import drive_letter, input_locations, is_live, open_input, volume_read_only
@@ -367,8 +367,6 @@ def main(argv=None):
         heartbeat.stop()
     return _finish(args, code)
 
-
-GENERIC_SOURCES = {'windows-events'}     # read for every product: not a product of its own
 
 
 def database_stats(sources):

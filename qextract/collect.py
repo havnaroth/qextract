@@ -29,6 +29,7 @@ DETECTION_COLUMNS += report.DETECTION_EXTRA
 
 ZIP_DEFLATED = 8
 ZIP_PASSWORD = b'infected'  # nosec B105 - the default: the agreed convention for sharing malware, not a secret
+GENERIC_SOURCES = {'windows-events'}     # read for every product: not a product of its own
 RECOVERED_EXTENSION = 'infected'
 METADATA_SUFFIX = 'metadata.txt'
 DEFAULT_MAX_DECODE_BYTES = 1024 * 1024 * 1024
@@ -327,8 +328,23 @@ class Collector:
         """Every match before anything is copied, so the size of the event logs is known
         up front. Folder listings are cached, so the second walk costs nothing."""
         plan = []
+        products = sum(1 for s in sources if s.get('id') not in GENERIC_SOURCES)
         for volume in volumes:
             roots = volume.roots()
+            self.log(f'Volume {volume.name}: {volume.description}')
+            if roots != ['']:
+                self.log(f'  Windows folders found under: {", ".join("/" + r for r in roots)}')
+            for root in roots:
+                host = read_host(volume, root)
+                if host:
+                    self.hosts[volume.name] = host
+                    h = public(host)
+                    problem = f" ({h['error']})" if h.get('error') else ''
+                    self.log(f"  Host: {h.get('computer', '?')}, {h.get('os', 'Windows version unknown')}, "
+                             f"time zone {h.get('time_zone', 'unknown')}{problem}")
+                    break
+            self.log(f'  Searching for {products} products ...')
+            t_search = time.monotonic()
             matches = []
             for source in sources:
                 self.status(f"searching {volume.name} for {source.get('name', source['id'])}")
@@ -345,6 +361,9 @@ class Collector:
                                   if owners.get(key, source['id']) == source['id']), key=lambda e: e.path.lower())
                 if entries:
                     work.append((source, art, entries))
+            found = {s['id'] for s, _a, _e in work if s.get('id') not in GENERIC_SOURCES}
+            self.log(f'  Search done in {time.monotonic() - t_search:.1f} s: '
+                     f'{sum(len(e) for _s, _a, e in work)} file(s) of {len(found)} product(s)')
             plan.append((volume, roots, work))
         return plan
 
@@ -451,19 +470,9 @@ class Collector:
         try:
             files = SafeWriter(files_csv, FILE_COLUMNS, extrasaction='ignore')
             files.writeheader()
-            for volume, roots, work in plan:
-                self.log(f'Volume {volume.name}: {volume.description}')
-                if roots != ['']:
-                    self.log(f'  Windows folders found under: {", ".join("/" + r for r in roots)}')
-                for root in roots:
-                    host = read_host(volume, root)
-                    if host:
-                        self.hosts[volume.name] = host
-                        h = public(host)
-                        problem = f" ({h['error']})" if h.get('error') else ''
-                        self.log(f"  Host: {h.get('computer', '?')}, {h.get('os', 'Windows version unknown')}, "
-                                 f"time zone {h.get('time_zone', 'unknown')}{problem}")
-                        break
+            for volume, _roots, work in plan:
+                if work:
+                    self.log(f'Copying and decoding ({volume.name}):')
                 for source, art, entries in work:
                     self.status(f"copying / decoding {source['name']} - {art['name']} ({len(entries)} file(s))")
                     t_work = time.monotonic()
