@@ -1,13 +1,15 @@
 """Copy matched files out of the volumes, run decoders and write everything into one zip."""
 
+import collections
 import csv
 import datetime
 import hashlib
 import io
 import os
 import re
+import time
 
-from . import report
+from . import mft, report
 from .decoders import DECODERS
 from .fs import error_text
 from .host import public, read_host
@@ -30,6 +32,7 @@ ZIP_PASSWORD = b'infected'  # nosec B105 - the default: the agreed convention fo
 RECOVERED_EXTENSION = 'infected'
 METADATA_SUFFIX = 'metadata.txt'
 DEFAULT_MAX_DECODE_BYTES = 1024 * 1024 * 1024
+SLOW_SOURCE = 1.0     # seconds: a source this slow is named in the log
 
 _BAD_CHARS = re.compile(r'[<>:"|?*/\\\x00-\x1f]')
 _FORMULA_START = ('=', '+', '-', '@', '\t', '\r')
@@ -133,6 +136,11 @@ class Context:
     def warn(self, message):
         self.collector.warn(f'{self.volume.name}/{self.source["id"]}: {message}')
 
+    @property
+    def host(self):
+        """What host.read_host found on this volume ({} when nothing): time zone, ANSI code page."""
+        return self.collector.hosts.get(self.volume.name, {})
+
     def save_decoded(self, entry, data, suffix='.decoded'):
         """A readable form of an obfuscated log or settings file (not malware), next to the
         copies: info/decoded/<volume>/<path><suffix>."""
@@ -156,7 +164,7 @@ class Collector:
     (reports, copied files, log, summary)."""
 
     def __init__(self, out, log, max_decode_bytes=DEFAULT_MAX_DECODE_BYTES, started=None, password=None,
-                 protected=(), zip_name=None):
+                 protected=(), zip_name=None, file_history=True):
         self.out = os.path.abspath(out)
         # the zip is always encrypted: a custom password may replace "infected", never remove it
         self.password = password.encode('utf-8') if password else ZIP_PASSWORD
@@ -176,6 +184,11 @@ class Collector:
         self._tables = {}
         # filled by run(), read by the CLI for summary.txt / summary.json
         self.hosts, self.detections, self.quarantine, self.incidents = {}, [], [], []
+        # seconds per source: searching the volumes, and copying / decoding / parsing
+        self.timings = collections.defaultdict(lambda: {'search': 0.0, 'work': 0.0})
+        # the $MFT / $UsnJrnl history of the files the products named (mft.py)
+        self.file_history = file_history
+        self.history = {'records': 0, 'usn_events': 0, 'seconds': 0.0, 'notes': []}
 
     def warn(self, message):
         self.warnings.append(message)
@@ -212,6 +225,14 @@ class Collector:
             self._members.add(f'{stem}.{METADATA_SUFFIX}'.lower())
             self._archive().writestr(f'{stem}.{METADATA_SUFFIX}', metadata.encode('utf-8'))
         return f'{self.zip_name}/{name}'
+
+    def add_member(self, name, data):
+        """A report outside info/ (e.g. mft/), str written as UTF-8 with BOM."""
+        if isinstance(data, str):
+            data = data.encode('utf-8-sig')
+        member = self._member(name)
+        self._archive().writestr(member, data)
+        return f'{self.zip_name}/{member}'
 
     def add_info(self, name, data):
         """A report or other non-malware file into info/ (str is written as UTF-8 with BOM)."""
@@ -307,8 +328,14 @@ class Collector:
         plan = []
         for volume in volumes:
             roots = volume.roots()
-            matches = [(source, art, matched) for source in sources for art in source['artifacts']
-                       if (matched := self._match(volume, art, roots))]
+            matches = []
+            for source in sources:
+                t0 = time.monotonic()
+                for art in source['artifacts']:
+                    matched = self._match(volume, art, roots)
+                    if matched:
+                        matches.append((source, art, matched))
+                self.timings[source['id']]['search'] += time.monotonic() - t0
             owners = self._owners(volume, roots, sources, matches)
             work = []
             for source, art, matched in matches:
@@ -318,6 +345,60 @@ class Collector:
                     work.append((source, art, entries))
             plan.append((volume, roots, work))
         return plan
+
+    def _wanted_paths(self):
+        """The absolute file paths the products named: incidents, quarantine, detections."""
+        # only what a product called a threat: ASR / controlled folder access events name the
+        # process that triggered the rule (e.g. svchost.exe), not a malicious file
+        paths = {i.get('path', '') for i in self.incidents if i.get('path_type') == 'file' and i.get('threats')}
+        paths |= {p for r in self.quarantine for p in str(r.get('path_norm') or '').split('; ')}
+        paths |= {p for r in self.detections if r.get('category') in ('detection', 'response') and r.get('threat')
+                  and r.get('path_type') in ('file', 'mixed') for p in str(r.get('path_norm') or '').split('; ')}
+        return {p for p in paths if re.match(r'^[A-Za-z]:\\', p)}
+
+    def _file_history(self, plan):
+        """$MFT / $J records of the named files -> mft/ in the zip, and the incidents learn when
+        their file was on the disk first."""
+        paths = self._wanted_paths()
+        if not paths:
+            return
+        t0 = time.monotonic()
+        records, events = [], []
+        read = 0
+        for volume, roots, _work in plan:
+            host = self.hosts.get(volume.name)
+            drive = host.get('system_drive', 'C:') if host else None
+            if not host:
+                # a collection with $MFT but no registry: its files are the C: drive's. An image
+                # partition without Windows is not guessed (C:\ paths would match the wrong one)
+                if hasattr(volume, 'fs') or next(iter(volume.glob(f'{roots[0]}/$MFT' if roots[0] else '$MFT')),
+                                                 None) is None:
+                    continue
+                drive = 'C:'
+                self.history['notes'].append(f'{volume.name}: no registry to tell the drive letter; taken as C:')
+            try:
+                found, usn, notes = mft.history_for(volume, roots[0], drive, paths, self.log)
+            except (OSError, ValueError, TimeoutError) as err:
+                self.warn(f'{volume.name}: file history not read: {error_text(err)}')
+                continue
+            records += found
+            events += usn
+            self.history['notes'] += [f'{volume.name}: {n}' for n in notes]
+            read += 0 if notes and notes[0].startswith('no $MFT') else 1
+        self.history.update(records=len(records), usn_events=len(events), seconds=round(time.monotonic() - t0, 2))
+        if not read:
+            self.history['notes'].append('no $MFT read: it needs an NTFS image, a raw drive (administrator) '
+                                         'or a collection that holds $MFT')
+            return
+        first = mft.first_on_disk(records, events)
+        for inc in self.incidents:
+            known = first.get(str(inc.get('path', '')).lower())
+            if not known:
+                continue
+            inc['on_disk_since'], inc['on_disk_evidence'] = known
+            inc['dwell'] = report.duration(known[0], inc.get('first_seen', ''))
+        self.add_member('mft/file_records.csv', _csv(mft.RECORD_COLUMNS, records, sort=False))
+        self.add_member('mft/usn_events.csv', _csv(mft.USN_COLUMNS, events))
 
     def run(self, volumes, sources, copy_event_logs=None):
         """copy_event_logs: None = copy them, or a callable(count, total bytes) -> bool that
@@ -350,6 +431,7 @@ class Collector:
                                  f"time zone {h.get('time_zone', 'unknown')}{problem}")
                         break
                 for source, art, entries in work:
+                    t_work = time.monotonic()
                     s = stats.setdefault(source['id'], {'name': source['name'], 'files': 0, 'bytes': 0,
                                                         'quarantine_items': 0, 'recovered': 0, 'events': 0})
                     self.log(f'  {source["name"]} - {art["name"]}: {len(entries)} file(s)')
@@ -384,6 +466,7 @@ class Collector:
                         for r in rows:
                             r.setdefault('volume', volume.name)
                             r.setdefault('source', source['id'])
+                            r.setdefault('product', source.get('name', source['id']))   # incidents.csv
                             quarantine.append(r)
                             s['quarantine_items'] += 1
                             s['recovered'] += 1 if r.get('saved_as') else 0
@@ -404,6 +487,7 @@ class Collector:
                         s['events'] += len(rows)
                         if rows:
                             self.log(f'    {len(rows)} event(s) for the timeline')
+                    self.timings[source['id']]['work'] += time.monotonic() - t_work
                 for w in volume.warnings:
                     self.warn(f'{volume.name}: {w}')
         finally:
@@ -415,7 +499,21 @@ class Collector:
             self.add_info('quarantine.csv', _csv(QUARANTINE_COLUMNS, quarantine, sort=False))
             self.detections, self.quarantine = detections, quarantine
         self.add_info('detections.csv', _csv(DETECTION_COLUMNS, detections))
+        if self.file_history:
+            try:
+                self._file_history(plan)
+            except Exception as err:  # noqa: BLE001 - the history is an extra; the rest is written
+                self.warn(f'file history failed: {err!r}')
         self.add_info('incidents.csv', _csv(report.INCIDENT_COLUMNS, self.incidents, sort=False))
         for name, rows in self._tables.items():
             self.add_info(f'{safe_name(name)}.csv', _csv(list(dict.fromkeys(k for r in rows for k in r)), rows))
+        slow = sorted(((t['search'] + t['work'], sid, t) for sid, t in self.timings.items()
+                       if t['search'] + t['work'] >= SLOW_SOURCE), reverse=True)
+        names = {s['id']: s['name'] for s in sources}
+        for total, sid, t in slow:
+            self.log(f"  Slow: {names.get(sid, sid)} {total:.1f} s (search {t['search']:.1f} s, "
+                     f"copy / decode / parse {t['work']:.1f} s)")
+        for sid, s in stats.items():
+            t = self.timings.get(sid, {})
+            s['seconds'] = round(t.get('search', 0) + t.get('work', 0), 2)
         return {k: v for k, v in stats.items() if v['files'] or v['quarantine_items'] or v['events']}

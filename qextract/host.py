@@ -78,6 +78,9 @@ def read_host(volume, root=''):
             tz_name = _value(tzkey, 'TimeZoneKeyName') or ''
             if tz_name:
                 host['time_zone'] = tz_name
+            acp = _value(system.get_key_by_path(fr'\{cs}\Control\Nls\CodePage'), 'ACP')
+            if isinstance(acp, str) and acp.isdigit() and len(acp) <= 5:
+                host['ansi_codepage'] = f'cp{acp}'    # text logs of older programs (e.g. cp1250)
             active = _value(tzkey, 'ActiveTimeBias')
             if isinstance(active, int):
                 host['active_bias_minutes'] = active - (1 << 32) if active >= 1 << 31 else active

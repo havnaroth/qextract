@@ -19,4 +19,4 @@ def parser(name):
     return register
 
 
-from . import evtx, mplog, roguekiller, withsecure  # noqa: E402,F401  (registers the built-in parsers)
+from . import avast, emsisoft, evtx, kaspersky, mplog, roguekiller, superantispyware, withsecure  # noqa: E402,F401  (registers the built-in parsers)

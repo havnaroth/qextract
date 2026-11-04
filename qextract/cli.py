@@ -106,6 +106,10 @@ def main(argv=None):
                    help='password of an encrypted input ZIP (e.g. a Velociraptor collection)')
     p.add_argument('--no-elevate', action='store_true',
                    help='for a drive letter without admin rights: do not offer to restart as administrator')
+    p.add_argument('--no-file-history', action='store_true',
+                   help='skip the $MFT / $UsnJrnl history of the detected files (the mft folder of the zip: when a file'
+                        'was on the disk before its first detection); it reads the whole $MFT, seconds on a '
+                        'workstation, a minute on a large server')
     p.add_argument('--no-update-check', action='store_true',
                    help='do not ask GitHub whether a newer qextract exists (the exe asks by default, in the '
                         'background; nothing is downloaded). Use it where any network traffic matters')
@@ -272,7 +276,8 @@ def main(argv=None):
 
     try:
         collector = Collector(out, log, max_decode_bytes=args.max_decode_mb * 1024 * 1024, started=started_at,
-                              password=args.password, protected=protected, zip_name=zip_name)
+                              password=args.password, protected=protected, zip_name=zip_name,
+                              file_history=not args.no_file_history)
     except UnsafeOutput as e:
         p.error(str(e))
     except OSError as e:
@@ -302,6 +307,9 @@ def main(argv=None):
     summary['hosts'] = {vol: public(h) for vol, h in collector.hosts.items()}
     summary['incidents'] = len(collector.incidents)
     summary['timeline'] = dict(collections.Counter(r.get('category', 'other') for r in collector.detections))
+    summary['file_history'] = collector.history if collector.file_history else 'off'
+    summary['seconds_per_source'] = {sid: {k: round(v, 2) for k, v in t.items()}
+                                     for sid, t in sorted(collector.timings.items())}
 
     found = summary.get('found', {})
     log('')
@@ -408,7 +416,8 @@ def _offer_elevation(args, out):
     if args.password:
         argv += ['--password', args.password]
     argv += [flag for flag, on in (('--include-deleted', args.include_deleted), ('--force', args.force),
-                                   ('--no-update-check', args.no_update_check)) if on]
+                                   ('--no-update-check', args.no_update_check),
+                                   ('--no-file-history', getattr(args, 'no_file_history', False))) if on]
     if elevate.relaunch(argv):
         print('Continuing in the administrator window.')
         return True
