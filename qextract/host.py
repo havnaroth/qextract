@@ -97,6 +97,16 @@ def read_host(volume, root=''):
             root_dir = _value(cv, 'SystemRoot') or ''
             if re.match(r'^[A-Za-z]:\\', root_dir):
                 host['system_drive'] = root_dir[:2].upper()
+            # SID -> profile folder: names the owner SID of a file (quarantine metadata)
+            profiles = {}
+            plist = software.get_key_by_path(r'\Microsoft\Windows NT\CurrentVersion\ProfileList')
+            for i in range(min(plist.number_of_sub_keys, 1000) if plist is not None else 0):
+                key = plist.get_sub_key(i)
+                folder = _value(key, 'ProfileImagePath')
+                if isinstance(folder, str) and re.fullmatch(r'S-1-[0-9-]{1,180}', key.name or ''):
+                    profiles[key.name] = folder[:260]
+            if profiles:
+                host['profiles'] = profiles
             if tz_name:
                 zone = software.get_key_by_path(f'{TZ_KEY}\\{tz_name}')
                 rules = _rules(_value(zone, 'TZI'))

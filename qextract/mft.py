@@ -16,15 +16,18 @@ Everything is read from the evidence and checked: record sizes, fixups, attribut
 """
 
 import collections
+import datetime
 import re
 import struct
 import time
 
-from .decoders.util import filetime
+from .decoders.util import filetime, zone_fields
 
 CHUNK = 16 << 20
 ROOT_RECORD = 5
 NAME_LIMIT = 50               # same-name records in other folders kept per name
+ZONE_STREAM = 'zone.identifier'   # "Mark of the Web": where a downloaded file came from
+ZONE_MAX = 4096
 REASONS = ((0x1, 'data overwrite'), (0x2, 'data extend'), (0x4, 'data truncation'), (0x10, 'named data overwrite'),
            (0x20, 'named data extend'), (0x40, 'named data truncation'), (0x100, 'file create'),
            (0x200, 'file delete'), (0x400, 'ea change'), (0x800, 'security change'), (0x1000, 'rename old name'),
@@ -35,13 +38,24 @@ REASONS = ((0x1, 'data overwrite'), (0x2, 'data extend'), (0x4, 'data truncation
 # the path, where the row comes from and the times that matter first; $FILE_NAME before
 # $STANDARD_INFORMATION (the folder index only has $FILE_NAME), the details last
 RECORD_COLUMNS = ['path', 'state', 'size', 'fn_created', 'fn_modified', 'si_created', 'si_modified',
-                  'note', 'match', 'target', 'record', 'sequence', 'directory',
+                  'zone_id', 'host_url', 'referrer_url', 'note', 'match', 'target', 'record', 'sequence', 'directory',
                   'fn_mft_modified', 'fn_accessed', 'si_mft_modified', 'si_accessed', 'volume']
 USN_COLUMNS = ['time', 'event', 'path', 'name', 'record', 'sequence', 'parent_record', 'usn', 'target',
                'volume']
 FILETIME_MIN, FILETIME_MAX = 119600064000000000, 159000000000000000      # 1980 .. 2104
 _U16, _II, _Q = struct.Struct('<H'), struct.Struct('<II'), struct.Struct('<Q')
 _NONZERO = re.compile(b'[^\x00]')
+
+
+def _span(a, b):
+    """'7 h 12 min' / '3 d 4 h' between two ISO times (the report module would import back)."""
+    try:
+        seconds = int((datetime.datetime.fromisoformat(b.rstrip('Z')) -
+                       datetime.datetime.fromisoformat(a.rstrip('Z'))).total_seconds())
+    except ValueError:
+        return '?'
+    days, hours, minutes = seconds // 86400, seconds % 86400 // 3600, seconds % 3600 // 60
+    return f'{days} d {hours} h' if days else f'{hours} h {minutes} min'
 
 
 def _ft(value):
@@ -93,6 +107,16 @@ def parse_record(rec):
         atype, alen = struct.unpack_from('<II', rec, a)
         if atype == 0xFFFFFFFF or alen < 16 or a + alen > end:
             break
+        if atype == 0x80 and rec[a + 9] and 'zone' not in out:     # a named $DATA: an alternate stream
+            name_off, nlen = struct.unpack_from('<H', rec, a + 10)[0], rec[a + 9]
+            if a + name_off + 2 * nlen <= a + alen and \
+                    rec[a + name_off:a + name_off + 2 * nlen].decode('utf-16-le', 'replace').lower() == ZONE_STREAM:
+                if rec[a + 8] == 0 and a + 22 <= end:                # resident: the text is in the record
+                    vlen, voff = struct.unpack_from('<IH', rec, a + 16)
+                    if voff >= 16 and a + voff + vlen <= a + alen:
+                        out['zone'] = bytes(rec[a + voff:a + voff + min(vlen, ZONE_MAX)])
+                else:
+                    out['zone'] = None                               # non-resident: not read (rare, > ~700 bytes)
         if atype == 0x80 and rec[a + 9] == 0 and out['size'] is None:      # the unnamed $DATA
             if rec[a + 8] == 0 and a + 20 <= end:
                 out['size'] = struct.unpack_from('<I', rec, a + 16)[0]          # resident: value length
@@ -141,6 +165,7 @@ class History:
         self.found = []               # (record number, parsed record, matching name entry)
         self.per_name = collections.Counter()
         self.records = 0
+        self.usn_span = None          # (oldest, newest) time in $UsnJrnl:$J
 
     def _full(self, data, off, size, number):
         """The slow, exact way: fixups applied, every attribute parsed."""
@@ -235,8 +260,8 @@ class History:
         return '/'.join(reversed(parts))
 
 
-def _stream_mft(source, history, deadline):
-    """source: (read(offset, size) -> bytes, total size)."""
+def _stream_mft(source, history, deadline, status=None):
+    """source: (read(offset, size) -> bytes, total size). status: gets 'reading $MFT: 45% ...'."""
     read, total = source
     first = read(0, 1024)
     if len(first) < 48 or first[:4] != b'FILE':
@@ -255,6 +280,8 @@ def _stream_mft(source, history, deadline):
         data = data[:len(data) - len(data) % size]
         history.feed(data, off // size, size)
         off += len(data)
+        if status:
+            status(f'reading $MFT: {off * 100 // max(total, 1)}% of {total // size:,} records')
     return size
 
 
@@ -279,7 +306,11 @@ def record_rows(history, volume_name, drive):
                         'or timestomping')
         if n['space'] == 2:
             note.append('8.3 name')
+        zone = zone_fields(parsed['zone'].decode('utf-8', 'replace')) if parsed.get('zone') else {}
+        if 'zone' in parsed and parsed['zone'] is None:
+            note.append('Zone.Identifier stored outside the record (not read)')
         rows.append({
+            **zone,
             'target': drive + '\\' + rel.replace('/', '\\') if exact else '',
             'match': 'path' if exact else 'name only (another folder)',
             'path': drive + '\\' + rel.replace('/', '\\'), 'record': number, 'sequence': parsed['sequence'],
@@ -293,10 +324,12 @@ def record_rows(history, volume_name, drive):
 
 
 def parse_usn(data, history, records, drive, volume_name, limit=200000):
-    """Every USN record (v2 / v3) of the data; the ones of the wanted records or names."""
+    """Every USN record (v2 / v3) of the data; the ones of the wanted records or names.
+    history.usn_span gets the oldest and newest time in the journal (what it can show at all)."""
     rows = []
     off = 0
     names = history.names
+    oldest = newest = None
     while off + 60 <= len(data) and len(rows) < limit:
         length = struct.unpack_from('<I', data, off)[0]
         if length == 0:
@@ -323,6 +356,9 @@ def parse_usn(data, history, records, drive, volume_name, limit=200000):
             nlen, noff = struct.unpack_from('<HH', data, off + 72)
             record, seq = ref_lo & 0xFFFFFFFFFFFF, ref_lo >> 48
             parent_rec = par_lo & 0xFFFFFFFFFFFF
+        if FILETIME_MIN < ts < FILETIME_MAX:
+            oldest = ts if oldest is None or ts < oldest else oldest
+            newest = ts if newest is None or ts > newest else newest
         if noff + nlen <= length:
             name = data[off + noff:off + noff + nlen].decode('utf-16-le', 'replace')
             if (record, seq) in records or name.lower() in names:
@@ -333,6 +369,7 @@ def parse_usn(data, history, records, drive, volume_name, limit=200000):
                              'target': drive + '\\' + rel.replace('/', '\\') if rel.lower() in history.targets else '',
                              'volume': volume_name})
         off += length
+    history.usn_span = (_ft(oldest), _ft(newest)) if oldest else None
     return rows
 
 
@@ -502,7 +539,7 @@ def _file_sources(volume, root):
     return (read, mft.size), usn, stream
 
 
-def history_for(volume, root, drive, paths, log, seconds=600):
+def history_for(volume, root, drive, paths, log, seconds=600, status=None):
     """-> (record rows, USN rows, notes) for the wanted absolute paths on this drive."""
     rel = sorted({p[3:].replace('\\', '/') for p in paths if re.match(rf'^{re.escape(drive)}\\', p, re.IGNORECASE)})
     if not rel:
@@ -518,10 +555,12 @@ def history_for(volume, root, drive, paths, log, seconds=600):
     if mft_src is None:
         return [], [], ['no $MFT on this volume (NTFS image, raw drive or a collection with $MFT needed)']
     try:
-        _stream_mft(mft_src, history, t0 + seconds)
+        _stream_mft(mft_src, history, t0 + seconds, status)
     finally:
         if stream is not None:
             stream.close()
+    if status:
+        status('reading the folder indexes ($I30) of the detected files')
     records = record_rows(history, volume.name, drive)
     wanted = {(r['record'], r['sequence']) for r in records}
     # a folder index entry of a file whose own record is here, with the same $FILE_NAME times,
@@ -529,31 +568,98 @@ def history_for(volume, root, drive, paths, log, seconds=600):
     known = {(r['path'].lower(), r['fn_created'], r['fn_modified']) for r in records}
     records += [r for r in index_rows(history, volume, drive, volume.name)
                 if (r['path'].lower(), r['fn_created'], r['fn_modified']) not in known]
+    if status and usn:
+        status(f'reading $UsnJrnl:$J ({len(usn) // 1048576:,} MB)')
     usn_rows = parse_usn(usn, history, wanted, drive, volume.name) if usn else []
     if usn is None:
         notes.append('no $UsnJrnl:$J')
+    elif history.usn_span:
+        a, b = history.usn_span
+        shown = [t[:19].replace('T', ' ') for t in (a, b)]
+        notes.append(f'$UsnJrnl:$J covers {shown[0]} .. {shown[1]} UTC '
+                     f'({_span(a, b)}): file moves and creations before that are not in it')
     log(f'  File history: {history.records:,} MFT records read, {len(records)} matching record(s), '
         f'{len(usn_rows)} USN event(s) for {len(rel)} file(s) in {time.monotonic() - t0:.1f} s')
     return records, usn_rows, notes
 
 
-def first_on_disk(records, usn_rows):
-    """-> {target path lower: (earliest time, what shows it)} from path matches."""
-    best = {}
+MOVE_COLUMNS = ['target', 'time', 'step', 'from', 'to', 'record', 'sequence', 'usn', 'evidence', 'volume']
 
-    def offer(target, when, what):
+
+def file_moves(records, usn_rows):
+    """The way each detected file took on this volume, from $UsnJrnl: a move or rename inside
+    one NTFS volume keeps the file's record number, so the journal's "rename old name" /
+    "rename new name" pairs of that record are its hops (as far back as the journal reaches).
+    A copy or a move from another drive is a new record and is not followed here.
+    -> (rows for mft\\file_moves.csv, {target lower: one-line journey})"""
+    owner = {}
+    for r in records:
+        if r.get('match') == 'path' and r.get('target') and r.get('record') != '':
+            owner.setdefault((r['record'], r['sequence']), r['target'])
+    for u in usn_rows:
+        if u.get('target'):
+            owner.setdefault((u['record'], u['sequence']), u['target'])
+    by_file = collections.defaultdict(list)
+    for u in usn_rows:
+        key = (u['record'], u['sequence'])
+        if key in owner:
+            by_file[key].append(u)
+    rows, journeys = [], {}
+    for key, events in by_file.items():
+        target = owner[key]
+        steps, old = [], None
+        for u in sorted(events, key=lambda e: (e['usn'], e['time'])):
+            ev = u['event']
+            base = {'target': target, 'time': u['time'], 'record': key[0], 'sequence': key[1], 'usn': u['usn'],
+                    'evidence': f"$UsnJrnl USN {u['usn']}", 'volume': u.get('volume', '')}
+            if 'file create' in ev and not steps:
+                steps.append(dict(base, step='created', **{'from': '', 'to': u['path']}))
+            if 'rename old name' in ev:
+                old = u['path']
+            elif 'rename new name' in ev:
+                frm = old or ''
+                same_folder = frm.rsplit('\\', 1)[0].lower() == u['path'].rsplit('\\', 1)[0].lower()
+                steps.append(dict(base, step='renamed' if same_folder and frm else 'moved',
+                                  **{'from': frm, 'to': u['path']}))
+                old = None
+            if 'file delete' in ev:
+                steps.append(dict(base, step='deleted', **{'from': u['path'], 'to': ''}))
+        rows += steps
+        if any(s['step'] in ('moved', 'renamed') for s in steps):
+            parts = []
+            for s in steps:
+                when = s['time'][:19].replace('T', ' ')
+                if s['step'] == 'created':
+                    parts.append(f"{when} created in {s['to']}")
+                elif s['step'] in ('moved', 'renamed'):
+                    parts.append(f"{when} {s['step']} to {s['to']}")
+                else:
+                    parts.append(f"{when} deleted")
+            journeys[target.lower()] = ' -> '.join(parts)
+    return rows, journeys
+
+
+def first_on_disk(records, usn_rows):
+    """-> {target path lower: (earliest time, what shows it)} from path matches: when the file
+    ARRIVED in that place. Only times the system sets on creation count: $FILE_NAME created and
+    the journal's file create. Modified times are the age of the CONTENT (an unpack, a copy or a
+    download keeps them: lab, mimikatz unpacked 2026-11-02 carries 2022 write times) and
+    $STANDARD_INFORMATION created can be set by any tool; it is only used when nothing else is
+    there. All of them stay in mft\\file_records.csv."""
+    best, fallback = {}, {}
+
+    def offer(table, target, when, what):
         if target and when:
             key = target.lower()
-            if key not in best or when < best[key][0]:
-                best[key] = (when, what)
+            if key not in table or when < table[key][0]:
+                table[key] = (when, what)
     for r in records:
         if r['match'] == 'path':
-            offer(r['target'], r['fn_created'], '$MFT $FILE_NAME created')
-            offer(r['target'], r['si_created'], '$MFT $STANDARD_INFORMATION created')
-            # a copy, a restore or an unpack keeps the content's write time: the content is older
-            offer(r['target'], r['si_modified'], '$MFT $STANDARD_INFORMATION modified (the content)')
-            offer(r['target'], r['fn_modified'], '$MFT $FILE_NAME modified')
+            offer(best, r['target'], r['fn_created'], '$MFT $FILE_NAME created')
+            offer(fallback, r['target'], r['si_created'], '$MFT $STANDARD_INFORMATION created (settable by tools)')
     for u in usn_rows:
         if 'file create' in u['event']:
-            offer(u['target'], u['time'], '$J file create')
+            offer(best, u['target'], u['time'], '$J file create')
+    for key, value in fallback.items():
+        best.setdefault(key, value)
     return best
