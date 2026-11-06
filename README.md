@@ -2,7 +2,7 @@
 
 ### qextract
 
-[![](https://img.shields.io/badge/Category-DFIR%20%2F%20Incident%20Response-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Language-Python%203.11-E5A505?style=flat-square&logo=python&logoColor=white)]() [![](https://img.shields.io/badge/Build%20script-PowerShell-E5A505?style=flat-square&logo=powershell&logoColor=white)]() [![](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Version-0.3.2-E5A505?style=flat-square&color=green)]() [![](https://img.shields.io/badge/License-All%20rights%20reserved-E5A505?style=flat-square&color=lightgrey)]()
+[![](https://img.shields.io/badge/Category-DFIR%20%2F%20Incident%20Response-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Language-Python%203.11-E5A505?style=flat-square&logo=python&logoColor=white)]() [![](https://img.shields.io/badge/Build%20script-PowerShell-E5A505?style=flat-square&logo=powershell&logoColor=white)]() [![](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-E5A505?style=flat-square)]() [![](https://img.shields.io/badge/Version-0.3.3-E5A505?style=flat-square&color=green)]() [![](https://img.shields.io/badge/License-All%20rights%20reserved-E5A505?style=flat-square&color=lightgrey)]()
 
 <br clear="left">
 
@@ -192,7 +192,17 @@ The CSVs keep their columns; normalized ones are appended for every product alik
 language independent), `path_norm` (`\Device\HarddiskVolumeN`, `%SystemDrive%`, `\\?\` and `amsi:_` resolved)
 with `path_type`, `log`, `sha256` / `md5` / `threat_family` / `severity` from the details, `details_json` and
 `incident`; quarantine.csv adds `quarantined_utc` (local times converted with the host's time zone rules
-from the registry), `recovery`, `verified_by` and `warning`.
+from the registry), `recovery`, `verified_by`, `warning` and `log_hash`.
+
+**Recovered files are checked twice where possible:**
+- **Against the quarantine itself:** the hash or size the quarantine stored.
+- **Against the logs:** when the quarantine kept no hash, a hash a log recorded for the same file
+  (Kaspersky and SUPERAntiSpyware MD5, Emsisoft SHA1, WithSecure and RogueKiller SHA256) verifies
+  the recovered file, e.g. `verified_by` `md5 (Kaspersky log)`. A log hash that differs is only a
+  warning: a log may describe another version of the file.
+
+SQLite databases in WAL mode (Kaspersky, WithSecure) are read together with their `-wal` file,
+where the newest records often still are; the evidence itself is not changed.
 
 **File history:** not every host has real-time protection and not every sample is detected on
 arrival. For every file a product named, qextract reads the whole `$MFT` once (also records of
@@ -211,6 +221,41 @@ a move from another drive starts a new file and is not followed. It needs an NTF
 (administrator) or a collection that holds `$MFT` / `$J`; it takes seconds on a workstation
 (2 million records about 10 s) and is turned off with `--no-file-history`. The journal is small:
 on a busy machine it covers hours or days.
+
+**File journey:** where the detected file was before the product found it.
+
+How qextract follows the file:
+- A move or rename on the same NTFS drive keeps the file's `$MFT` record number. The
+  `$UsnJrnl:$J` logs each change as a "rename old name" / "rename new name" pair under that number.
+- The product often deletes the file's record when it quarantines the file. qextract therefore first
+  takes the record number from the journal events at the detected path. Then it collects every
+  event of that record, including those under the names the file had before, such as a download's
+  `.tmp` name.
+
+Where the result goes:
+- `mft\file_moves.csv`: one row per step (created, renamed, moved, deleted) with its time, the old
+  and the new path, and the USN as evidence.
+- The `journey` column of `incidents.csv` and the incident block of `summary.txt`.
+- `summary.txt` also states what period the journal covers. Older moves are not in it.
+
+A copy or a move from another drive creates a new file, so the journey starts there. Lab check
+(2026-11-06, Windows 11, Microsoft Defender): EICAR was downloaded to Temp and Windows wrote the Mark
+of the Web. The file was renamed, moved to Downloads, then to `C:\run`, and blocked on execution.
+qextract rebuilt every step to the second:
+
+```
+I0001  2026-11-06 14:08:39 UTC  Virus:DOS/EICAR_Test_File
+  file     C:\run\invoice.exe
+  actions  14:09:59  quarantined  Microsoft Defender
+  user     QX-LAB-BASE\lab
+  origin   https://secure.eicar.org/eicar.com; from page https://www.eicar.org/download-anti-malware-testfile/; zone 3 (internet)  [Zone.Identifier kept with the quarantined file]
+  on disk  since 2026-11-06 14:07:47 UTC  -  51 s before the detection  [$MFT $FILE_NAME created]
+  journey  2026-11-06 14:07:47 created in C:\Users\lab\AppData\Local\Temp\stage\download_7f3a.tmp
+           2026-11-06 14:07:50 renamed to C:\Users\lab\AppData\Local\Temp\stage\invoice-2026.pdf.exe
+           2026-11-06 14:08:11 moved to C:\Users\lab\Downloads\stage\invoice-2026.pdf.exe
+           2026-11-06 14:08:31 moved to C:\run\invoice.exe
+           2026-11-06 14:09:59 deleted
+```
 
 The evidence and the machine are both treated as hostile (crafted files, planted links
 while running as administrator).

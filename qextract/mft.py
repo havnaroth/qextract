@@ -325,7 +325,20 @@ def record_rows(history, volume_name, drive):
 
 def parse_usn(data, history, records, drive, volume_name, limit=200000):
     """Every USN record (v2 / v3) of the data; the ones of the wanted records or names.
-    history.usn_span gets the oldest and newest time in the journal (what it can show at all)."""
+    history.usn_span gets the oldest and newest time in the journal (what it can show at all).
+
+    A detected file is often gone from $MFT (quarantined: its record deleted or reused), so its
+    record number is not known up front and only events under its final NAME match. The events
+    at the target path tell the (record, sequence); a second pass then takes every event of that
+    record - also under the names it had before (a download's .tmp name, an earlier folder)."""
+    rows = _scan_usn(data, history, records, drive, volume_name, limit)
+    keys = set(records) | {(r['record'], r['sequence']) for r in rows if r['target']}
+    if keys != set(records):
+        rows = _scan_usn(data, history, keys, drive, volume_name, limit)
+    return rows
+
+
+def _scan_usn(data, history, records, drive, volume_name, limit):
     rows = []
     off = 0
     names = history.names
@@ -617,6 +630,10 @@ def file_moves(records, usn_rows):
             if 'rename old name' in ev:
                 old = u['path']
             elif 'rename new name' in ev:
+                # the journal writes "rename new name" twice (the second with "close"): one hop
+                if not old and steps and steps[-1]['step'] in ('moved', 'renamed') \
+                        and steps[-1]['to'].lower() == u['path'].lower():
+                    continue
                 frm = old or ''
                 same_folder = frm.rsplit('\\', 1)[0].lower() == u['path'].rsplit('\\', 1)[0].lower()
                 steps.append(dict(base, step='renamed' if same_folder and frm else 'moved',
