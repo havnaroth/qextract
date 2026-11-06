@@ -22,8 +22,8 @@ from . import host as hostinfo
 
 SCHEMA_VERSION = 2
 DETECTION_EXTRA = ['category', 'log', 'action_norm', 'path_norm', 'path_type', 'sha256', 'md5',
-                   'threat_family', 'severity', 'incident', 'details_json']
-QUARANTINE_EXTRA = ['quarantined_utc', 'recovery', 'verified_by', 'warning', 'path_norm', 'incident']
+                   'threat_family', 'severity', 'incident', 'details_json', 'sha1']
+QUARANTINE_EXTRA = ['quarantined_utc', 'recovery', 'verified_by', 'warning', 'path_norm', 'incident', 'log_hash']
 INCIDENT_COLUMNS = ['incident', 'first_seen', 'last_seen', 'path', 'path_type', 'threats', 'products',
                     'actions', 'events', 'logs', 'quarantined', 'recovered_files', 'sha256', 'users',
                     'processes', 'volume', 'on_disk_since', 'on_disk_evidence', 'dwell',
@@ -254,9 +254,10 @@ def normalize_detection(row, mapper, system_drive):
     low = {k.lower(): v for k, v in details.items()}
     if 'amsi' in str(low.get('scan source', '')).lower() and row['path_type'] == 'file':
         row['path_type'] = 'amsi'      # MPLog names the scanning process without the amsi: prefix
-    sha256, md5 = str(low.get('sha256', '')), str(low.get('md5', ''))
+    sha256, md5, sha1 = (str(low.get(k, '')) for k in ('sha256', 'md5', 'sha1'))
     row['sha256'] = sha256.lower() if re.fullmatch(r'[0-9a-fA-F]{64}', sha256) else ''
     row['md5'] = md5.lower() if re.fullmatch(r'[0-9a-fA-F]{32}', md5) else ''
+    row['sha1'] = sha1.lower() if re.fullmatch(r'[0-9a-fA-F]{40}', sha1) else ''
     family = low.get('family', '')
     if not family:
         m = _DEFENDER_NAME.match(str(row.get('threat', '')))
@@ -386,12 +387,27 @@ _PROFILE = re.compile(r'^[A-Za-z]:\\Users\\([^\\]+)\\', re.IGNORECASE)
 _SHARED_PROFILES = {'public', 'default', 'default user', 'all users'}
 
 
+# the built-in service accounts as Windows names them in its language (lab: Polish
+# "ZARZĄDZANIE NT\USŁUGA LOKALNA" in Defender events): not a person
+SERVICE_ACCOUNTS = {
+    'LOCAL SERVICE': 'LOCAL SERVICE', 'NETWORK SERVICE': 'NETWORK SERVICE',
+    'USŁUGA LOKALNA': 'LOCAL SERVICE', 'USŁUGA SIECIOWA': 'NETWORK SERVICE',
+    'LOKALER DIENST': 'LOCAL SERVICE', 'NETZWERKDIENST': 'NETWORK SERVICE',
+    'SERVICE LOCAL': 'LOCAL SERVICE', 'SERVICE RÉSEAU': 'NETWORK SERVICE',
+    'SERVICIO LOCAL': 'LOCAL SERVICE', 'SERVICIO DE RED': 'NETWORK SERVICE',
+    'SERVIZIO LOCALE': 'LOCAL SERVICE', 'SERVIZIO DI RETE': 'NETWORK SERVICE',
+}
+
+
 def account(name):
     """An account as the logs write it -> one spelling: the local system account has a name
     in the system language ('NT AUTHORITY\\SYSTEM', 'ZARZĄDZANIE NT\\SYSTEM', 'SYSTEM', S-1-5-18)."""
     name = str(name or '').strip()
     if name.upper() in ('SYSTEM', 'S-1-5-18') or name.upper().endswith('\\SYSTEM'):
         return 'SYSTEM'
+    service = SERVICE_ACCOUNTS.get(name.rsplit('\\', 1)[-1].upper())
+    if service:
+        return service
     return WELL_KNOWN_SIDS.get(name.upper(), name)
 
 
@@ -457,6 +473,39 @@ def _actions(values):
     return sorted(real) if real else sorted(acts & {'detected'})
 
 
+_WEAK = ('', 'none', 'size')          # verified_by values a log hash can improve on
+
+
+def verify_with_logs(events, quar):
+    """A recovered file whose quarantine stored no usable hash, checked against the hash a log
+    of the same incident (the same file) recorded: Kaspersky / SAS MD5, Emsisoft SHA1, ...
+    A match sets verified_by '<algorithm> (<product> log)'; a difference is only a warning (a
+    log may describe another version of the file) and never replaces a stored-hash check."""
+    logged = {}
+    for r in events:
+        for algo in ('sha256', 'sha1', 'md5'):
+            if r.get(algo):
+                logged.setdefault((algo, r[algo]), r.get('product') or r.get('source') or 'a')
+    if not logged:
+        return
+    for q in quar:
+        if not q.get('saved_as'):
+            continue
+        matched = next(((algo, logged[(algo, str(q.get(algo, '')).lower())]) for algo in ('sha256', 'sha1', 'md5')
+                        if (algo, str(q.get(algo, '')).lower()) in logged), None)
+        if matched:
+            q['log_hash'] = f'{matched[0]} matches the {matched[1]} log'
+            if str(q.get('verified_by', '')) in _WEAK:
+                q['verified_by'] = f'{matched[0]} ({matched[1]} log)'
+                if str(q.get('status', '')).startswith('recovered ('):
+                    q['status'] = f"recovered ({matched[0].upper()} matches the {matched[1]} log)"
+            continue
+        algos = {a for a, _v in logged} & {a for a in ('sha256', 'sha1', 'md5') if q.get(a)}
+        if algos:
+            q['log_hash'] = f"{'/'.join(sorted(algos))} differs from the log's"
+            q['warning'] = '; '.join(x for x in (q.get('warning'), q['log_hash']) if x)
+
+
 def build_incidents(detections, quarantine, profiles=None):
     """Assigns row['incident'] and returns the incident rows (sorted by first time)."""
     rows = []
@@ -464,6 +513,7 @@ def build_incidents(detections, quarantine, profiles=None):
         iid = f'I{n:04d}'
         events = list({id(m[4]): m[4] for m in members if m[5] == 'event'}.values())
         quar = list({id(m[4]): m[4] for m in members if m[5] == 'quarantine'}.values())
+        verify_with_logs(events, quar)
         for m in members:
             ids = [x for x in str(m[4].get('incident', '')).split(', ') if x]
             if iid not in ids:

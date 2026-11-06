@@ -75,23 +75,29 @@ def _row(f, record, time, event, processes):
 @parser('withsecure_edr')
 def withsecure_edr(ctx, files, options):
     rows, seen = [], set()
+    by_path = {f.path.lower(): f for f in files}
     for f in files:
         if f.name.lower() not in NAMES:
             continue
         try:
-            con = open_sqlite(ctx.read(f))
-            processes = _processes(con)
-            # the JSON is matched as text first: only a few of thousands of events are detections
-            for record, data, created in con.execute(
-                    'SELECT id, data, time_created FROM event WHERE data LIKE \'%"iname"%\''):
-                if data in seen:            # the queues repeat events of state.db
-                    continue
-                seen.add(data)
-                with contextlib.suppress(ValueError, TypeError):
-                    event = json.loads(data)
-                    if isinstance(event, dict) and event.get('iname'):
-                        time = filetime(created if isinstance(created, int) else 0)
-                        rows.append(_row(f, record, time, event, processes))
+            # pstor databases run in WAL mode: the newest events may only be in <name>-wal
+            wal = by_path.get(f.path.lower() + '-wal')
+            con = open_sqlite(ctx.read(f), ctx.read(wal) if wal else None)
+            try:
+                processes = _processes(con)
+                # the JSON is matched as text first: only a few of thousands of events are detections
+                for record, data, created in con.execute(
+                        'SELECT id, data, time_created FROM event WHERE data LIKE \'%"iname"%\''):
+                    if data in seen:            # the queues repeat events of state.db
+                        continue
+                    seen.add(data)
+                    with contextlib.suppress(ValueError, TypeError):
+                        event = json.loads(data)
+                        if isinstance(event, dict) and event.get('iname'):
+                            time = filetime(created if isinstance(created, int) else 0)
+                            rows.append(_row(f, record, time, event, processes))
+            finally:
+                con.close()
         except Exception as e:  # noqa: BLE001 - one unreadable database must not hide the others
             ctx.warn(f'{f.path}: EDR database not readable ({error_text(e)})')
     return rows
